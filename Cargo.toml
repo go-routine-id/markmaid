@@ -1,0 +1,16 @@
+[package]
+name = "markmaid"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.75"
+description = "Framework-agnostic Markdown rendering engine in pure Rust: hand-written GFM-subset parser, document layout to plain positioned geometry (DocScene) any GUI toolkit can paint, SVG/HTML writers, and first-class inline mermaid diagrams via flowmaid. No external dependencies."
+license = "GPL-3.0-or-later"
+readme = "README.md"
+keywords = ["markdown", "gfm", "layout", "renderer", "svg"]
+categories = ["text-processing", "visualization"]
+# Repo GitHub menyusul setelah diputuskan pemilik proyek.
+
+[dependencies]
+# Satu-satunya dependency adalah keluarga sendiri: engine diagram
+# flowmaid (zero-dep) — blok ```mermaid menjadi geometri inline.
+flowmaid = "0.11"
