@@ -8,7 +8,7 @@ license = "GPL-3.0-or-later"
 readme = "README.md"
 keywords = ["markdown", "gfm", "layout", "renderer", "svg"]
 categories = ["text-processing", "visualization"]
-# Repo GitHub menyusul setelah diputuskan pemilik proyek.
+repository = "https://github.com/go-routine-id/markmaid"
 
 [dependencies]
 # Satu-satunya dependency adalah keluarga sendiri: engine diagram
