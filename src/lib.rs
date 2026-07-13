@@ -1,3 +1,8 @@
+// Layout code walks parallel arrays (column widths, row heights) by
+// index on purpose — iterator zips would obscure the math, not
+// clarify it. Same stance as flowmaid.
+#![allow(clippy::needless_range_loop)]
+
 //! markmaid — a framework-agnostic Markdown rendering engine.
 //!
 //! Sister crate to [flowmaid](https://crates.io/crates/flowmaid) and
