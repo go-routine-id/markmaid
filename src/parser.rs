@@ -170,8 +170,8 @@ fn parse_blocks(lines: &[&str]) -> Vec<Block> {
     out
 }
 
-/// ``` or ~~~ opener → (fence char, run length, lowercased first
-/// info word).
+/// Opening code fence (three-or-more backticks or tildes) →
+/// (fence char, run length, lowercased first info word).
 fn fence_open(line: &str) -> Option<(char, usize, String)> {
     let ch = line.chars().next()?;
     if ch != '`' && ch != '~' {
@@ -245,7 +245,19 @@ fn is_html_open(line: &str) -> bool {
     if chars.next() != Some('<') {
         return false;
     }
-    matches!(chars.next(), Some(c) if c.is_ascii_alphabetic() || c == '!' || c == '/')
+    if !matches!(chars.next(), Some(c) if c.is_ascii_alphabetic() || c == '!' || c == '/') {
+        return false;
+    }
+    // `<https://…>` is an autolink, not an HTML block — otherwise a
+    // line that is only an autolink is eaten verbatim as raw HTML and
+    // any prose after it is swallowed too (bug hunt). A scheme URL is
+    // recognised by `://` before the closing `>`.
+    if let Some(close) = line.find('>') {
+        if line[1..close].contains("://") {
+            return false;
+        }
+    }
+    true
 }
 
 /// A `| --- | :---: |` style delimiter row.
@@ -482,9 +494,11 @@ pub fn parse_inlines(text: &str) -> Vec<Inline> {
     let mut out = Vec::new();
     inline_into(text, &Style::default(), &mut out);
     // Merge adjacent identical-style runs for compact output.
+    // Empty-text runs are dropped EXCEPT links: `[](url)` must keep
+    // its anchor and href (bug hunt / CommonMark).
     let mut merged: Vec<Inline> = Vec::new();
     for r in out {
-        if r.text.is_empty() {
+        if r.text.is_empty() && r.link.is_none() {
             continue;
         }
         if let Some(last) = merged.last_mut() {
@@ -580,10 +594,24 @@ fn inline_into(s: &str, st: &Style, out: &mut Vec<Inline>) {
             if let Some((text, url, len)) = parse_link(rest) {
                 push_text(out, &mut buf, st);
                 let inner_style = Style {
-                    link: Some(url),
+                    link: Some(url.clone()),
                     ..st.clone()
                 };
-                inline_into(text, &inner_style, out);
+                if text.is_empty() {
+                    // `[](url)` keeps its anchor: emit an explicit
+                    // empty-text link run (the recursion would emit
+                    // nothing).
+                    out.push(Inline {
+                        text: String::new(),
+                        strong: st.strong,
+                        em: st.em,
+                        code: false,
+                        strike: st.strike,
+                        link: Some(url),
+                    });
+                } else {
+                    inline_into(text, &inner_style, out);
+                }
                 i += len;
                 continue;
             }
@@ -734,6 +762,31 @@ mod tests {
 
     fn text_of(inlines: &[Inline]) -> String {
         inlines.iter().map(|r| r.text.as_str()).collect()
+    }
+
+    // ── regressions from the bug hunt ──
+
+    #[test]
+    fn lone_autolink_is_a_link_not_an_html_block() {
+        let d = parse("<https://example.com>");
+        let Block::Paragraph(c) = &d.blocks[0] else {
+            panic!("got {:?}", d.blocks[0]);
+        };
+        assert_eq!(c[0].link.as_deref(), Some("https://example.com"));
+        // And prose after the autolink is not swallowed as HTML.
+        let d = parse("<https://example.com>\nmore prose");
+        assert!(matches!(d.blocks[0], Block::Paragraph(_)));
+        assert!(!d.blocks.iter().any(|b| matches!(b, Block::Html(_))));
+        // A real HTML tag line is still an HTML block.
+        assert!(matches!(parse("<div>\nx\n</div>").blocks[0], Block::Html(_)));
+    }
+
+    #[test]
+    fn empty_text_link_run_is_kept() {
+        let r = parse_inlines("before [](https://x.dev) after");
+        assert!(r
+            .iter()
+            .any(|x| x.text.is_empty() && x.link.as_deref() == Some("https://x.dev")));
     }
 
     #[test]

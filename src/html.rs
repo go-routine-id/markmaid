@@ -62,13 +62,42 @@ fn esc_attr(s: &str) -> String {
     out
 }
 
+/// Neutralise dangerous URL schemes so a rendered link can never
+/// execute script. A URL is SAFE when it has no scheme (relative /
+/// fragment) or its scheme is one of http/https/mailto/tel/ftp;
+/// anything else (`javascript:`, `data:`, `vbscript:`, unknown) is
+/// dropped to an inert empty href. The module's injection-safety
+/// claim depends on this.
+fn safe_href(url: &str) -> &str {
+    let t = url.trim_start();
+    if let Some(colon) = t.find(':') {
+        let scheme = &t[..colon];
+        // A real scheme is non-empty, has no path punctuation before
+        // the ':', and is made of scheme chars.
+        let is_scheme = !scheme.is_empty()
+            && !scheme.contains(['/', '?', '#'])
+            && scheme
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || matches!(c, '+' | '-' | '.'));
+        if is_scheme
+            && !matches!(
+                scheme.to_ascii_lowercase().as_str(),
+                "http" | "https" | "mailto" | "tel" | "ftp"
+            )
+        {
+            return "";
+        }
+    }
+    url
+}
+
 /// One styled run: nested tags outside-in `a > strong > em > del >
 /// code`, text escaped, literal `\n` as a `<br>` hard break.
 fn inline_html(out: &mut String, run: &Inline) {
     let mut close: Vec<&str> = Vec::new();
     if let Some(url) = &run.link {
         out.push_str("<a href=\"");
-        out.push_str(&esc_attr(url));
+        out.push_str(&esc_attr(safe_href(url)));
         out.push_str("\">");
         close.push("</a>");
     }
@@ -248,6 +277,52 @@ mod tests {
 
     fn doc(blocks: Vec<Block>) -> Doc {
         Doc { blocks }
+    }
+
+    // ── regressions from the bug hunt ──
+
+    #[test]
+    fn dangerous_url_schemes_are_neutralised() {
+        for bad in [
+            "javascript:alert(1)",
+            "JavaScript:alert(1)",
+            "  javascript:alert(1)",
+            "data:text/html,<script>x</script>",
+            "vbscript:msgbox(1)",
+        ] {
+            assert_eq!(safe_href(bad), "", "must drop: {bad}");
+        }
+        for ok in [
+            "https://x.dev",
+            "http://x.dev",
+            "mailto:a@b.c",
+            "tel:+1",
+            "/relative",
+            "#anchor",
+            "./rel",
+            "path/to",
+        ] {
+            assert_eq!(safe_href(ok), ok, "must keep: {ok}");
+        }
+        // End to end: the rendered anchor carries no script scheme.
+        let d = doc(vec![Block::Paragraph(vec![Inline {
+            text: "x".into(),
+            link: Some("javascript:alert(1)".into()),
+            ..Inline::default()
+        }])]);
+        let out = html_of(&d);
+        assert!(out.contains("<a href=\"\">x</a>"), "got: {out}");
+        assert!(!out.contains("javascript:"));
+    }
+
+    #[test]
+    fn empty_text_link_keeps_its_anchor() {
+        let d = doc(vec![Block::Paragraph(vec![Inline {
+            text: String::new(),
+            link: Some("https://x.dev".into()),
+            ..Inline::default()
+        }])]);
+        assert!(html_of(&d).contains("<a href=\"https://x.dev\"></a>"));
     }
 
     fn styled(text: &str, f: impl Fn(&mut Inline)) -> Inline {

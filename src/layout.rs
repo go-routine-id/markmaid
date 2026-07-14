@@ -23,6 +23,14 @@ use flowmaid::model::Document;
 // ── Layout constants (tweak here) ──────────────────────────────────
 /// Outer page margin, all four sides.
 const MARGIN: f64 = 24.0;
+/// Requested widths are clamped into this finite, drawable range;
+/// a non-finite width falls back to the default.
+const MIN_DOC_WIDTH: f64 = 2.0 * MARGIN + 32.0;
+const MAX_DOC_WIDTH: f64 = 100_000.0;
+const DEFAULT_DOC_WIDTH: f64 = 720.0;
+/// Minimum content width kept inside a list item, so deep nesting
+/// stops indenting instead of marching off the right edge.
+const MIN_LIST_CONTENT: f64 = 48.0;
 /// Heading size multipliers for levels 1..=6 (x base size).
 const HEADING_SCALE: [f64; 6] = [1.7, 1.45, 1.25, 1.1, 1.0, 0.95];
 /// Space above a heading: levels 1-2 / levels 3+.
@@ -367,11 +375,19 @@ fn plain_text(inlines: &[Inline]) -> String {
 /// Lay a parsed document out. `opts.width` is the full page width;
 /// content occupies the column between the outer margins.
 pub fn layout(doc: &Doc, opts: &LayoutOptions) -> DocScene {
-    let mut scene = DocScene {
-        width: opts.width,
-        ..DocScene::default()
+    let mut scene = DocScene::default();
+    // Sanitise the requested width: a non-finite width (inf/NaN)
+    // would poison every coordinate and emit an invalid SVG, and a
+    // sub-page width leaves no room to draw (bug hunt). Clamp to a
+    // finite, drawable range; fall back to a sane default when the
+    // caller passes garbage.
+    let width = if opts.width.is_finite() {
+        opts.width.clamp(MIN_DOC_WIDTH, MAX_DOC_WIDTH)
+    } else {
+        DEFAULT_DOC_WIDTH
     };
-    let col = (opts.width - 2.0 * MARGIN).max(1.0);
+    scene.width = width;
+    let col = width - 2.0 * MARGIN;
     let end = layout_blocks(&mut scene, &doc.blocks, MARGIN, col, MARGIN, opts.base_size);
     scene.height = end + MARGIN;
     scene
@@ -608,11 +624,15 @@ fn layout_list(scene: &mut DocScene, list: &List, x: f64, w: f64, y: f64, base: 
                 }));
             }
         }
+        // Cap the indent so a deeply nested item never pushes its
+        // marker/content past the right edge: once the column is
+        // narrow, stop indenting (bug hunt).
+        let indent = LIST_INDENT.min((w - MIN_LIST_CONTENT).max(0.0));
         let end = layout_blocks(
             scene,
             &item.blocks,
-            x + LIST_INDENT,
-            (w - LIST_INDENT).max(1.0),
+            x + indent,
+            (w - indent).max(MIN_LIST_CONTENT),
             y,
             base,
         );
@@ -742,7 +762,15 @@ fn layout_mermaid(scene: &mut DocScene, source: &str, x: f64, w: f64, y: f64, ba
             ((ps.width, ps.height), DiagramView::Pie(ps))
         }
     };
-    let scale = ((w - 2.0 * DIAGRAM_PAD) / size.0).clamp(0.01, 1.0);
+    // Fit-to-width, shrinking as far as needed (no lower clamp — a
+    // very wide diagram must still fit inside its card, not overflow;
+    // bug hunt). Guard the divide against a zero-width scene.
+    let avail = (w - 2.0 * DIAGRAM_PAD).max(1.0);
+    let scale = if size.0 > 0.0 {
+        (avail / size.0).min(1.0)
+    } else {
+        1.0
+    };
     let (cw, ch) = (
         size.0 * scale + 2.0 * DIAGRAM_PAD,
         size.1 * scale + 2.0 * DIAGRAM_PAD,
@@ -837,15 +865,18 @@ fn escape(s: &str) -> String {
 /// elements straight from the flowmaid writers.
 pub(crate) fn doc_to_svg(scene: &DocScene) -> String {
     let mut s = String::new();
+    // Defensive: the writer never emits a zero/negative/non-finite
+    // dimension even if handed a hand-built scene — a conformant
+    // rasteriser (rsvg) refuses "no dimensions" (bug hunt). layout()
+    // already guarantees a sane width; this is belt-and-braces.
+    let w = if scene.width.is_finite() { scene.width.max(1.0) } else { 1.0 };
+    let h = if scene.height.is_finite() { scene.height.max(1.0) } else { 1.0 };
     s.push_str(&format!(
-        "<svg xmlns=\"http://www.w3.org/2000/svg\" width=\"{w:.0}\" height=\"{h:.0}\" \
-         viewBox=\"0 0 {w:.0} {h:.0}\" font-family=\"Helvetica, Arial, sans-serif\">\n",
-        w = scene.width,
-        h = scene.height
+        "<svg xmlns=\"http://www.w3.org/2000/svg\" width=\"{w:.1}\" height=\"{h:.1}\" \
+         viewBox=\"0 0 {w:.1} {h:.1}\" font-family=\"Helvetica, Arial, sans-serif\">\n",
     ));
     s.push_str(&format!(
-        "<rect width=\"{:.0}\" height=\"{:.0}\" fill=\"#ffffff\"/>\n",
-        scene.width, scene.height
+        "<rect width=\"{w:.1}\" height=\"{h:.1}\" fill=\"#ffffff\"/>\n",
     ));
     for item in &scene.items {
         match item {
@@ -1023,6 +1054,80 @@ mod tests {
                 Item::Text(_) => {}
             }
         }
+    }
+
+    // ── regressions from the bug hunt ──
+
+    #[test]
+    fn non_finite_width_is_sanitised() {
+        for w in [f64::INFINITY, f64::NEG_INFINITY, f64::NAN] {
+            let sc = layout(&doc(vec![Block::Rule, para("hi")]), &opts(w));
+            assert!(sc.width.is_finite() && sc.width > 0.0, "width {}", sc.width);
+            assert_within(&sc);
+            let svg = crate::scene::to_svg(&sc);
+            assert!(!svg.contains("inf") && !svg.contains("NaN"), "{svg}");
+        }
+    }
+
+    #[test]
+    fn tiny_and_zero_width_stay_drawable() {
+        for w in [0.0, 0.4, -50.0, 10.0] {
+            let sc = layout(&doc(vec![para("hello world")]), &opts(w));
+            assert!(sc.width >= MIN_DOC_WIDTH - 1e-9);
+            let svg = crate::scene::to_svg(&sc);
+            // Header width is positive and not rounded to zero.
+            assert!(svg.contains("width=\"") && !svg.contains("width=\"0"), "{}", &svg[..80]);
+        }
+    }
+
+    #[test]
+    fn deeply_nested_list_marker_stays_on_page() {
+        // 20 levels deep, each a single item wrapping the next.
+        fn nest(depth: usize) -> Block {
+            let inner: Vec<Block> = if depth == 0 {
+                vec![para("word")]
+            } else {
+                vec![para("x"), nest(depth - 1)]
+            };
+            Block::List(List {
+                start: None,
+                items: vec![ListItem { checked: None, blocks: inner }],
+            })
+        }
+        let sc = layout(&doc(vec![nest(20)]), &opts(300.0));
+        for t in texts(&sc) {
+            let w = text_w(&t.text, t.size, t.mono);
+            assert!(
+                t.x + w <= sc.width + 0.5,
+                "marker/text '{}' at x={} overflows width {}",
+                t.text,
+                t.x,
+                sc.width
+            );
+        }
+    }
+
+    #[test]
+    fn very_wide_diagram_fits_its_card() {
+        // A flowchart of many nodes in one row is very wide; it must
+        // shrink to fit, not overflow at a 0.01 floor.
+        let mut src = String::from("flowchart LR\n");
+        for i in 0..40 {
+            src.push_str(&format!("N{i}[Node number {i} label]-->N{}\n", i + 1));
+        }
+        let block = Block::Code { lang: "mermaid".into(), source: src };
+        let sc = layout(&doc(vec![block]), &opts(720.0));
+        let d = sc
+            .items
+            .iter()
+            .find_map(|i| match i {
+                Item::Diagram(d) => Some(d),
+                _ => None,
+            })
+            .expect("diagram");
+        assert!(d.scale > 0.0 && d.scale <= 1.0);
+        assert!(d.x + d.size.0 * d.scale <= sc.width + 0.5, "diagram overflows");
+        assert_within(&sc);
     }
 
     #[test]
@@ -1477,8 +1582,8 @@ mod tests {
     fn svg_document_shape() {
         let sc = layout(&doc(vec![para("hi")]), &opts(300.0));
         let svg = doc_to_svg(&sc);
-        assert!(svg.starts_with("<svg xmlns=\"http://www.w3.org/2000/svg\" width=\"300\""));
-        assert!(svg.contains("viewBox=\"0 0 300"));
+        assert!(svg.starts_with("<svg xmlns=\"http://www.w3.org/2000/svg\" width=\"300.0\""));
+        assert!(svg.contains("viewBox=\"0 0 300.0"));
         assert!(svg.contains("font-family=\"Helvetica, Arial, sans-serif\""));
         assert!(svg.contains("fill=\"#ffffff\"/>"));
         assert!(svg.trim_end().ends_with("</svg>"));
