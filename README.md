@@ -32,9 +32,11 @@ for link in &scene.links { /* hit-test clicks, open urls */ }
 
 ## Supported Markdown (honest subset)
 
-ATX headings (`#`–`######`), paragraphs with lazy continuation and hard breaks (trailing `\` or two spaces), fenced code (``` and `~~~`, info strings), blockquotes (nested, containing any block), unordered/ordered lists with nesting and GFM task markers (`- [x]`), GFM tables (with `\|` escapes), thematic breaks, raw HTML blocks (kept verbatim, shown as code — never interpreted), and inline `**strong**`, `*em*`, `` `code` ``, `~~strike~~`, `[links](url)`, `<autolinks>`, backslash escapes.
+ATX headings (`#`–`######`), paragraphs with lazy continuation and hard breaks (trailing `\` or two spaces), fenced code (``` and `~~~`, info strings), blockquotes (nested, containing any block), unordered/ordered lists with nesting and GFM task markers (`- [x]`), GFM tables (with `\|` escapes), thematic breaks, raw HTML blocks (kept verbatim, shown as code — never interpreted), and inline `**strong**`, `*em*`, `` `code` ``, `~~strike~~`, `[links](url)`, `![images](src)`, `<autolinks>`, backslash escapes.
 
-Not supported (by design, documented): setext headings, reference-style links, link titles, footnotes, inline images (planned as geometry placeholders), and full CommonMark emphasis corner cases. The parser is infallible — anything unrecognised degrades to plain text, never an error.
+Images are laid out as a **reserved placeholder box** carrying the source — the engine stays zero-decode (no image crate, no pixels), so a consumer with a decoder draws the raster into the box; the SVG writer emits `<image href>` and the HTML writer emits `<img>` (both scheme-sanitised, `data:` URIs allowed).
+
+Not supported (by design, documented): setext headings, reference-style links, link titles, footnotes, and full CommonMark emphasis corner cases. The parser is infallible — anything unrecognised degrades to plain text, never an error.
 
 ## Status
 

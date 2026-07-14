@@ -91,8 +91,32 @@ fn safe_href(url: &str) -> &str {
     url
 }
 
+/// Image source scheme filter: allows http/https/relative and
+/// `data:` (common for inline images), drops `javascript:` etc.
+fn safe_img(url: &str) -> &str {
+    let t = url.trim_start();
+    if let Some(colon) = t.find(':') {
+        let scheme = &t[..colon];
+        let is_scheme = !scheme.is_empty()
+            && !scheme.contains(['/', '?', '#'])
+            && scheme
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || matches!(c, '+' | '-' | '.'));
+        if is_scheme
+            && !matches!(
+                scheme.to_ascii_lowercase().as_str(),
+                "http" | "https" | "data" | "ftp"
+            )
+        {
+            return "";
+        }
+    }
+    url
+}
+
 /// One styled run: nested tags outside-in `a > strong > em > del >
-/// code`, text escaped, literal `\n` as a `<br>` hard break.
+/// code`, text escaped, literal `\n` as a `<br>` hard break. An image
+/// run becomes an `<img>` (inside any surrounding link).
 fn inline_html(out: &mut String, run: &Inline) {
     let mut close: Vec<&str> = Vec::new();
     if let Some(url) = &run.link {
@@ -100,6 +124,17 @@ fn inline_html(out: &mut String, run: &Inline) {
         out.push_str(&esc_attr(safe_href(url)));
         out.push_str("\">");
         close.push("</a>");
+    }
+    if let Some(src) = &run.image {
+        out.push_str("<img src=\"");
+        out.push_str(&esc_attr(safe_img(src)));
+        out.push_str("\" alt=\"");
+        out.push_str(&esc_attr(&run.text));
+        out.push_str("\">");
+        for tag in close.iter().rev() {
+            out.push_str(tag);
+        }
+        return;
     }
     if run.strong {
         out.push_str("<strong>");
@@ -539,5 +574,39 @@ mod tests {
     fn text_nodes_escape_amp_lt_gt() {
         let html = html_of(&doc(vec![para("1 < 2 && 3 > 2")]));
         assert!(html.contains("<p>1 &lt; 2 &amp;&amp; 3 &gt; 2</p>"));
+    }
+
+    #[test]
+    fn image_becomes_img_with_escaped_alt() {
+        let html = html_of(&doc(vec![Block::Paragraph(vec![styled("A & B", |i| {
+            i.image = Some("pic.png".into());
+        })])]));
+        assert!(html.contains("<img src=\"pic.png\" alt=\"A &amp; B\">"));
+    }
+
+    #[test]
+    fn image_data_uri_is_allowed() {
+        let html = html_of(&doc(vec![Block::Paragraph(vec![styled("", |i| {
+            i.image = Some("data:image/png;base64,AAAA".into());
+        })])]));
+        assert!(html.contains("src=\"data:image/png;base64,AAAA\""));
+    }
+
+    #[test]
+    fn image_javascript_src_is_neutralised() {
+        let html = html_of(&doc(vec![Block::Paragraph(vec![styled("x", |i| {
+            i.image = Some("javascript:alert(1)".into());
+        })])]));
+        assert!(html.contains("<img src=\"\""));
+        assert!(!html.contains("javascript:"));
+    }
+
+    #[test]
+    fn linked_image_nests_img_in_anchor() {
+        let html = html_of(&doc(vec![Block::Paragraph(vec![styled("t", |i| {
+            i.image = Some("t.png".into());
+            i.link = Some("https://big.example/".into());
+        })])]));
+        assert!(html.contains("<a href=\"https://big.example/\"><img src=\"t.png\" alt=\"t\"></a>"));
     }
 }

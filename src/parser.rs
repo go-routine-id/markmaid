@@ -494,15 +494,21 @@ pub fn parse_inlines(text: &str) -> Vec<Inline> {
     let mut out = Vec::new();
     inline_into(text, &Style::default(), &mut out);
     // Merge adjacent identical-style runs for compact output.
-    // Empty-text runs are dropped EXCEPT links: `[](url)` must keep
-    // its anchor and href (bug hunt / CommonMark).
+    // Empty-text runs are dropped EXCEPT links and images, which
+    // carry a url/src even with no visible text.
     let mut merged: Vec<Inline> = Vec::new();
     for r in out {
-        if r.text.is_empty() && r.link.is_none() {
+        if r.text.is_empty() && r.link.is_none() && r.image.is_none() {
+            continue;
+        }
+        // Images never merge (each is its own replaced element).
+        if r.image.is_some() {
+            merged.push(r);
             continue;
         }
         if let Some(last) = merged.last_mut() {
-            if last.strong == r.strong
+            if last.image.is_none()
+                && last.strong == r.strong
                 && last.em == r.em
                 && last.code == r.code
                 && last.strike == r.strike
@@ -528,6 +534,7 @@ fn push_text(out: &mut Vec<Inline>, buf: &mut String, st: &Style) {
         code: false,
         strike: st.strike,
         link: st.link.clone(),
+        image: None,
     });
 }
 
@@ -558,6 +565,7 @@ fn inline_into(s: &str, st: &Style, out: &mut Vec<Inline>) {
                     code: true,
                     strike: st.strike,
                     link: st.link.clone(),
+                    image: None,
                 });
                 i += n + end + n;
                 continue;
@@ -589,6 +597,24 @@ fn inline_into(s: &str, st: &Style, out: &mut Vec<Inline>) {
             }
         }
 
+        // Image: ![alt](src). The alt is taken as plain text.
+        if b[i] == b'!' && b.get(i + 1) == Some(&b'[') {
+            if let Some((alt, src, len)) = parse_link(&s[i + 1..]) {
+                push_text(out, &mut buf, st);
+                out.push(Inline {
+                    text: alt.to_string(),
+                    strong: st.strong,
+                    em: st.em,
+                    code: false,
+                    strike: st.strike,
+                    link: st.link.clone(),
+                    image: Some(src),
+                });
+                i += 1 + len;
+                continue;
+            }
+        }
+
         // Link: [text](url).
         if b[i] == b'[' {
             if let Some((text, url, len)) = parse_link(rest) {
@@ -608,6 +634,7 @@ fn inline_into(s: &str, st: &Style, out: &mut Vec<Inline>) {
                         code: false,
                         strike: st.strike,
                         link: Some(url),
+                        image: None,
                     });
                 } else {
                     inline_into(text, &inner_style, out);
@@ -629,6 +656,7 @@ fn inline_into(s: &str, st: &Style, out: &mut Vec<Inline>) {
                         code: false,
                         strike: st.strike,
                         link: Some(url.to_string()),
+                        image: None,
                     });
                     i += close + 1;
                     continue;
@@ -973,5 +1001,39 @@ mod tests {
     fn adjacent_same_style_runs_merge() {
         let r = parse_inlines("plain \\* still plain");
         assert_eq!(r.len(), 1);
+    }
+
+    #[test]
+    fn images_parse_with_alt_and_src() {
+        let r = parse_inlines("before ![a cat](cat.png) after");
+        let img = r.iter().find(|x| x.image.is_some()).expect("image run");
+        assert_eq!(img.image.as_deref(), Some("cat.png"));
+        assert_eq!(img.text, "a cat");
+        // The surrounding text is preserved verbatim.
+        assert_eq!(text_of(&r), "before a cat after");
+    }
+
+    #[test]
+    fn image_empty_alt_is_allowed() {
+        let r = parse_inlines("![](logo.svg)");
+        assert_eq!(r.len(), 1);
+        assert_eq!(r[0].image.as_deref(), Some("logo.svg"));
+        assert_eq!(r[0].text, "");
+    }
+
+    #[test]
+    fn image_inside_link_keeps_both() {
+        // A linked thumbnail: the run is an image AND carries the link.
+        let r = parse_inlines("[![thumb](t.png)](https://big.example/)");
+        let img = r.iter().find(|x| x.image.is_some()).expect("image run");
+        assert_eq!(img.image.as_deref(), Some("t.png"));
+        assert_eq!(img.link.as_deref(), Some("https://big.example/"));
+    }
+
+    #[test]
+    fn bang_without_bracket_is_literal() {
+        let r = parse_inlines("50% off! [deal](d)");
+        assert!(r.iter().all(|x| x.image.is_none()));
+        assert!(r.iter().any(|x| x.link.as_deref() == Some("d")));
     }
 }

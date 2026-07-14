@@ -15,8 +15,8 @@
 
 use crate::model::{Block, Doc, Inline, List, Table};
 use crate::scene::{
-    role_color, Anchor, ColorRole, DiagramItem, DiagramView, DocScene, Item, LayoutOptions,
-    LineItem, LinkZone, RectItem, TextRun,
+    role_color, Anchor, ColorRole, DiagramItem, DiagramView, DocScene, ImageItem, Item,
+    LayoutOptions, LineItem, LinkZone, RectItem, TextRun,
 };
 use flowmaid::model::Document;
 
@@ -31,6 +31,13 @@ const DEFAULT_DOC_WIDTH: f64 = 720.0;
 /// Minimum content width kept inside a list item, so deep nesting
 /// stops indenting instead of marching off the right edge.
 const MIN_LIST_CONTENT: f64 = 48.0;
+/// Placeholder box for `![alt](src)` images (the engine cannot decode
+/// pixels): width fits the column up to this cap, height follows a
+/// neutral aspect within these bounds.
+const IMG_MAX_W: f64 = 460.0;
+const IMG_ASPECT: f64 = 0.6;
+const IMG_MIN_H: f64 = 120.0;
+const IMG_MAX_H: f64 = 300.0;
 /// Heading size multipliers for levels 1..=6 (x base size).
 const HEADING_SCALE: [f64; 6] = [1.7, 1.45, 1.25, 1.1, 1.0, 0.95];
 /// Space above a heading: levels 1-2 / levels 3+.
@@ -337,13 +344,51 @@ fn layout_inlines(
     base_role: ColorRole,
     force_strong: bool,
 ) -> f64 {
-    let toks = tokenize(inlines);
     let mut y = y;
-    for line in wrap_frags(&toks, x, w, size) {
-        emit_line(scene, line, 0.0, y, size, base_role, force_strong);
-        y += line_h(size);
+    // Images are replaced elements: split the run stream at each
+    // image, word-wrap the text segments, and give every image its
+    // own reserved box on its own line.
+    let mut seg: Vec<Inline> = Vec::new();
+    let flush = |scene: &mut DocScene, seg: &mut Vec<Inline>, y: f64| -> f64 {
+        if seg.is_empty() {
+            return y;
+        }
+        let toks = tokenize(seg);
+        let mut yy = y;
+        for line in wrap_frags(&toks, x, w, size) {
+            emit_line(scene, line, 0.0, yy, size, base_role, force_strong);
+            yy += line_h(size);
+        }
+        seg.clear();
+        yy
+    };
+    for run in inlines {
+        if let Some(src) = &run.image {
+            y = flush(scene, &mut seg, y);
+            y = layout_image(scene, src, &run.text, x, w, y);
+        } else {
+            seg.push(run.clone());
+        }
     }
-    y
+    flush(scene, &mut seg, y)
+}
+
+/// Reserve a placeholder box for one image and emit an
+/// [`Item::Image`]. Width fits the column (never enlarged), height
+/// follows a neutral placeholder aspect — a consumer that decodes
+/// the pixels re-fits to the intrinsic size.
+fn layout_image(scene: &mut DocScene, src: &str, alt: &str, x: f64, w: f64, y: f64) -> f64 {
+    let iw = w.min(IMG_MAX_W);
+    let ih = (iw * IMG_ASPECT).clamp(IMG_MIN_H, IMG_MAX_H);
+    scene.items.push(Item::Image(ImageItem {
+        x,
+        y,
+        w: iw,
+        h: ih,
+        src: src.to_string(),
+        alt: alt.to_string(),
+    }));
+    y + ih + BLOCK_SPACE
 }
 
 /// Inline content as a single unwrapped line of fragments measured
@@ -961,10 +1006,61 @@ pub(crate) fn doc_to_svg(scene: &DocScene) -> String {
                 s.push_str(&full[start..end]);
                 s.push_str("</svg>\n");
             }
+            Item::Image(im) => {
+                // Faint framed box + the raster via <image href>. A
+                // consumer whose href resolves shows the picture; if
+                // it can't load, the box (and the SVG's own <title>)
+                // remain. href is scheme-sanitised (no javascript:).
+                s.push_str(&format!(
+                    "<rect x=\"{:.1}\" y=\"{:.1}\" width=\"{:.1}\" height=\"{:.1}\" rx=\"4\" \
+                     fill=\"{}\" stroke=\"{}\"/>\n",
+                    im.x,
+                    im.y,
+                    im.w,
+                    im.h,
+                    role_color(ColorRole::CodeBg),
+                    role_color(ColorRole::Border),
+                ));
+                s.push_str(&format!(
+                    "<image x=\"{:.1}\" y=\"{:.1}\" width=\"{:.1}\" height=\"{:.1}\" \
+                     preserveAspectRatio=\"xMidYMid meet\" href=\"{}\"><title>{}</title></image>\n",
+                    im.x,
+                    im.y,
+                    im.w,
+                    im.h,
+                    escape(safe_src(&im.src)),
+                    escape(&im.alt),
+                ));
+            }
         }
     }
     s.push_str("</svg>\n");
     s
+}
+
+/// Neutralise dangerous URL schemes for an image source. Images may
+/// legitimately use `data:` URIs, so those are allowed alongside
+/// http/https/relative; `javascript:`/`vbscript:` and other unknown
+/// schemes become an inert empty ref.
+pub(crate) fn safe_src(url: &str) -> &str {
+    let t = url.trim_start();
+    if let Some(colon) = t.find(':') {
+        let scheme = &t[..colon];
+        let is_scheme = !scheme.is_empty()
+            && !scheme.contains(['/', '?', '#'])
+            && scheme
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || matches!(c, '+' | '-' | '.'));
+        if is_scheme
+            && !matches!(
+                scheme.to_ascii_lowercase().as_str(),
+                "http" | "https" | "data" | "ftp"
+            )
+        {
+            return "";
+        }
+    }
+    url
 }
 
 // ── Tests ───────────────────────────────────────────────────────────
@@ -1050,6 +1146,10 @@ mod tests {
                 Item::Diagram(d) => {
                     assert!(d.x >= -0.5);
                     assert!(d.x + d.size.0 * d.scale <= scene.width + 0.5);
+                }
+                Item::Image(im) => {
+                    assert!(im.x >= -0.5);
+                    assert!(im.x + im.w <= scene.width + 0.5, "image right {}", im.x + im.w);
                 }
                 Item::Text(_) => {}
             }
@@ -1668,5 +1768,46 @@ mod tests {
             &opts(300.0),
         );
         assert_within(&sc);
+    }
+
+    #[test]
+    fn image_reserves_a_box_inside_the_page() {
+        let sc = layout(
+            &doc(vec![Block::Paragraph(vec![styled("diagram", |i| {
+                i.image = Some("d.png".into());
+            })])]),
+            &opts(360.0),
+        );
+        assert_within(&sc);
+        let im = sc
+            .items
+            .iter()
+            .find_map(|it| match it {
+                Item::Image(im) => Some(im),
+                _ => None,
+            })
+            .expect("image item");
+        assert!(im.w > 0.0 && im.h > 0.0);
+        assert_eq!(im.src, "d.png");
+        assert_eq!(im.alt, "diagram");
+    }
+
+    #[test]
+    fn svg_emits_image_element_with_sanitised_href() {
+        let sc = layout(
+            &doc(vec![
+                Block::Paragraph(vec![styled("ok", |i| i.image = Some("pic.png".into()))]),
+                Block::Paragraph(vec![styled("bad", |i| {
+                    i.image = Some("javascript:alert(1)".into())
+                })]),
+            ]),
+            &opts(360.0),
+        );
+        let svg = doc_to_svg(&sc);
+        assert!(svg.contains("<image "));
+        assert!(svg.contains("href=\"pic.png\""));
+        // The dangerous scheme collapses to an empty ref; no script URL leaks.
+        assert!(svg.contains("href=\"\""));
+        assert!(!svg.contains("javascript:"));
     }
 }

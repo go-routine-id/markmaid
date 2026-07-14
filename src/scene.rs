@@ -52,6 +52,24 @@ pub enum Item {
     Line(LineItem),
     /// An inline mermaid diagram, laid out by the flowmaid engine.
     Diagram(DiagramItem),
+    /// An `![alt](src)` image: a RESERVED placeholder box carrying the
+    /// source. The engine cannot decode pixels (that needs an image
+    /// crate, against the zero-dependency ethos), so a consumer with
+    /// a decoder loads `src` and draws it into `(x, y, w, h)`; the
+    /// SVG writer emits `<image href>` and HTML emits `<img>`. The box
+    /// aspect is a placeholder — consumers may re-fit to intrinsic
+    /// size once loaded.
+    Image(ImageItem),
+}
+
+#[derive(Debug)]
+pub struct ImageItem {
+    pub x: f64,
+    pub y: f64,
+    pub w: f64,
+    pub h: f64,
+    pub src: String,
+    pub alt: String,
 }
 
 /// Positioned styled text. Never contains `\n` — the layout stage

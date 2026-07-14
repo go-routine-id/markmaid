@@ -35,8 +35,8 @@ pub mod scene;
 
 pub use model::{Block, Doc, Inline};
 pub use scene::{
-    ColorRole, DiagramItem, DiagramView, DocScene, Item, LayoutOptions, LineItem, LinkZone,
-    RectItem, TextRun,
+    ColorRole, DiagramItem, DiagramView, DocScene, ImageItem, Item, LayoutOptions, LineItem,
+    LinkZone, RectItem, TextRun,
 };
 
 /// Parse Markdown (GFM subset) into a [`Doc`]. Never fails: unknown

@@ -25,6 +25,12 @@ stateDiagram-v2
     Paid --> [*]
 ```
 
+## Architecture snapshot
+
+The current topology, exported nightly:
+
+![payment topology diagram](https://example.com/topology.png)
+
 ## SLA per component
 
 | Component | Target | Status |

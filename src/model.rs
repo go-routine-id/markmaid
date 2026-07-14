@@ -68,6 +68,11 @@ pub struct Inline {
     pub strike: bool,
     /// Some(url) = this run is (part of) a link.
     pub link: Option<String>,
+    /// Some(src) = this run is an image `![alt](src)`; `text` holds
+    /// the alt text. The engine reserves a placeholder box (it can't
+    /// decode pixels) and passes the src through to the consumer /
+    /// SVG `<image>` / HTML `<img>`.
+    pub image: Option<String>,
 }
 
 impl Inline {
