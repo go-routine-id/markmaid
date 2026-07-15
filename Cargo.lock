@@ -4,11 +4,13 @@ version = 3
 
 [[package]]
 name = "flowmaid"
-version = "0.13.0"
+version = "0.17.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "5aca814a4c49d35c2104e5edbe9d51f0a40110ba317604de19b555d78861c3ca"
 
 [[package]]
 name = "markmaid"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "flowmaid",
 ]

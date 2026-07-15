@@ -1,6 +1,6 @@
 [package]
 name = "markmaid"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2021"
 rust-version = "1.75"
 description = "Framework-agnostic Markdown rendering engine in pure Rust: hand-written GFM-subset parser, document layout to plain positioned geometry (DocScene) any GUI toolkit can paint, SVG/HTML writers, and first-class inline mermaid diagrams via flowmaid. No external dependencies."
@@ -13,5 +13,5 @@ repository = "https://github.com/go-routine-id/markmaid"
 [dependencies]
 # Satu-satunya dependency adalah keluarga sendiri: engine diagram
 # flowmaid (zero-dep) — blok ```mermaid menjadi geometri inline.
-# 0.14 = rilis dengan mindmap (radial + route) & journey.
-flowmaid = "0.15"
+# 0.17 = layout dagre-faithful + subgraph border-node clusters & label slots.
+flowmaid = "0.17"
