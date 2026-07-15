@@ -135,6 +135,8 @@ pub enum DiagramView {
     Class(flowmaid::class::ClassScene),
     Seq(flowmaid::seq::SeqScene),
     Pie(flowmaid::pie::PieScene),
+    Mind(flowmaid::mindmap::MindScene),
+    Journey(flowmaid::journey::JourneyScene),
 }
 
 /// Clickable region of a link, in document coordinates.

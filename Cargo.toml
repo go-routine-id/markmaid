@@ -13,4 +13,6 @@ repository = "https://github.com/go-routine-id/markmaid"
 [dependencies]
 # Satu-satunya dependency adalah keluarga sendiri: engine diagram
 # flowmaid (zero-dep) — blok ```mermaid menjadi geometri inline.
-flowmaid = "0.11"
+# LOKAL sementara: path agar sinkron dgn flowmaid (route() mindmap yang
+# belum dirilis). Kembalikan ke `flowmaid = "0.13"` setelah 0.13.1 rilis.
+flowmaid = { path = "../diagram-engine-studio/flowrs" }

@@ -27,6 +27,7 @@
 //! The only dependency is `flowmaid` itself (zero-dependency, same
 //! family) — mermaid fences become embedded diagram geometry.
 
+pub mod blocks;
 pub mod html;
 pub mod layout;
 pub mod model;

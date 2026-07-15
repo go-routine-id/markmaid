@@ -68,50 +68,46 @@ fn esc_attr(s: &str) -> String {
 /// anything else (`javascript:`, `data:`, `vbscript:`, unknown) is
 /// dropped to an inert empty href. The module's injection-safety
 /// claim depends on this.
-fn safe_href(url: &str) -> &str {
+/// Is this URL's scheme (if any) NOT in `allowed`? Control/whitespace
+/// chars inside the scheme are STRIPPED before the check, because a
+/// browser ignores them — so `java&#9;script:` must be normalised to
+/// `javascript` and blocked, not slip through the allowlist. Path
+/// punctuation before the `:` means it's a relative URL, not a scheme.
+pub(crate) fn scheme_blocked(url: &str, allowed: &[&str]) -> bool {
     let t = url.trim_start();
-    if let Some(colon) = t.find(':') {
-        let scheme = &t[..colon];
-        // A real scheme is non-empty, has no path punctuation before
-        // the ':', and is made of scheme chars.
-        let is_scheme = !scheme.is_empty()
-            && !scheme.contains(['/', '?', '#'])
-            && scheme
-                .chars()
-                .all(|c| c.is_ascii_alphanumeric() || matches!(c, '+' | '-' | '.'));
-        if is_scheme
-            && !matches!(
-                scheme.to_ascii_lowercase().as_str(),
-                "http" | "https" | "mailto" | "tel" | "ftp"
-            )
-        {
-            return "";
-        }
+    let Some(colon) = t.find(':') else {
+        return false;
+    };
+    let raw = &t[..colon];
+    if raw.contains(['/', '?', '#']) {
+        return false;
     }
-    url
+    let scheme: String = raw
+        .chars()
+        .filter(|c| !c.is_whitespace() && !c.is_control())
+        .map(|c| c.to_ascii_lowercase())
+        .collect();
+    !scheme.is_empty() && !allowed.contains(&scheme.as_str())
+}
+
+/// Neutralise dangerous link schemes; keep http/https/mailto/tel/ftp
+/// and relative URLs.
+fn safe_href(url: &str) -> &str {
+    if scheme_blocked(url, &["http", "https", "mailto", "tel", "ftp"]) {
+        ""
+    } else {
+        url
+    }
 }
 
 /// Image source scheme filter: allows http/https/relative and
 /// `data:` (common for inline images), drops `javascript:` etc.
 fn safe_img(url: &str) -> &str {
-    let t = url.trim_start();
-    if let Some(colon) = t.find(':') {
-        let scheme = &t[..colon];
-        let is_scheme = !scheme.is_empty()
-            && !scheme.contains(['/', '?', '#'])
-            && scheme
-                .chars()
-                .all(|c| c.is_ascii_alphanumeric() || matches!(c, '+' | '-' | '.'));
-        if is_scheme
-            && !matches!(
-                scheme.to_ascii_lowercase().as_str(),
-                "http" | "https" | "data" | "ftp"
-            )
-        {
-            return "";
-        }
+    if scheme_blocked(url, &["http", "https", "data", "ftp"]) {
+        ""
+    } else {
+        url
     }
-    url
 }
 
 /// One styled run: nested tags outside-in `a > strong > em > del >
@@ -324,9 +320,17 @@ mod tests {
             "  javascript:alert(1)",
             "data:text/html,<script>x</script>",
             "vbscript:msgbox(1)",
+            // Control chars inside the scheme must not bypass the filter
+            // (browsers strip them before matching the scheme).
+            "java\tscript:alert(1)",
+            "java\nscript:alert(1)",
+            "jav\rascript:alert(1)",
         ] {
             assert_eq!(safe_href(bad), "", "must drop: {bad}");
         }
+        // data: is allowed for images but not links.
+        assert_eq!(safe_img("data:image/png;base64,AAAA"), "data:image/png;base64,AAAA");
+        assert_eq!(safe_img("java\tscript:alert(1)"), "", "control-char bypass blocked for img");
         for ok in [
             "https://x.dev",
             "http://x.dev",

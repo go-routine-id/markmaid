@@ -806,6 +806,14 @@ fn layout_mermaid(scene: &mut DocScene, source: &str, x: f64, w: f64, y: f64, ba
             let ps = flowmaid::pie::scene(&d);
             ((ps.width, ps.height), DiagramView::Pie(ps))
         }
+        Document::Mindmap(d) => {
+            let ms = flowmaid::mindmap::scene(&d);
+            ((ms.width, ms.height), DiagramView::Mind(ms))
+        }
+        Document::Journey(d) => {
+            let js = flowmaid::journey::scene(&d);
+            ((js.width, js.height), DiagramView::Journey(js))
+        }
     };
     // Fit-to-width, shrinking as far as needed (no lower clamp — a
     // very wide diagram must still fit inside its card, not overflow;
@@ -986,6 +994,8 @@ pub(crate) fn doc_to_svg(scene: &DocScene) -> String {
                     DiagramView::Class(cs) => flowmaid::class::to_svg(cs),
                     DiagramView::Seq(ss) => flowmaid::seq::to_svg(ss),
                     DiagramView::Pie(ps) => flowmaid::pie::to_svg(ps),
+                    DiagramView::Mind(ms) => flowmaid::mindmap::to_svg(ms),
+                    DiagramView::Journey(js) => flowmaid::journey::to_svg(js),
                 };
                 // Strip the writer's outer <svg> element and re-wrap
                 // as a nested <svg>: the viewBox scales the content
@@ -1043,24 +1053,13 @@ pub(crate) fn doc_to_svg(scene: &DocScene) -> String {
 /// http/https/relative; `javascript:`/`vbscript:` and other unknown
 /// schemes become an inert empty ref.
 pub(crate) fn safe_src(url: &str) -> &str {
-    let t = url.trim_start();
-    if let Some(colon) = t.find(':') {
-        let scheme = &t[..colon];
-        let is_scheme = !scheme.is_empty()
-            && !scheme.contains(['/', '?', '#'])
-            && scheme
-                .chars()
-                .all(|c| c.is_ascii_alphanumeric() || matches!(c, '+' | '-' | '.'));
-        if is_scheme
-            && !matches!(
-                scheme.to_ascii_lowercase().as_str(),
-                "http" | "https" | "data" | "ftp"
-            )
-        {
-            return "";
-        }
+    // Shared scheme filter (strips control chars a browser would ignore,
+    // so `java\tscript:` can't bypass the allowlist).
+    if crate::html::scheme_blocked(url, &["http", "https", "data", "ftp"]) {
+        ""
+    } else {
+        url
     }
-    url
 }
 
 // ── Tests ───────────────────────────────────────────────────────────
