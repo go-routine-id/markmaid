@@ -528,12 +528,16 @@ fn layout_block(
         Block::Paragraph(inls) => {
             layout_inlines(scene, inls, x, w, y, base, ColorRole::Text, false, measure)
         }
-        Block::Code { lang, source } if is_mermaid(lang) => {
+        Block::Code { lang, source, highlight } if is_mermaid(lang) => {
             layout_mermaid(scene, source, x, w, y, base, measure)
         }
-        Block::Code { source, .. } => layout_code(scene, source, x, w, y, base, measure),
+        Block::Code {
+            source,
+            highlight,
+            ..
+        } => layout_code(scene, source, highlight, x, w, y, base, measure),
         // Raw HTML is shown verbatim as code — never interpreted.
-        Block::Html(source) => layout_code(scene, source, x, w, y, base, measure),
+        Block::Html(source) => layout_code(scene, source, &[], x, w, y, base, measure),
         Block::Quote(blocks) => layout_quote(scene, blocks, x, w, y, base, measure, table_overflow),
         Block::List(list) => layout_list(scene, list, x, w, y, base, measure, table_overflow),
         Block::Table(table) => layout_table(scene, table, x, w, y, base, measure, table_overflow),
@@ -581,12 +585,17 @@ fn layout_heading(
     end
 }
 
+/// Vertical padding around a highlighted code block line, so the
+/// highlight background does not touch neighbouring unhighlighted text.
+const CODE_HIGHLIGHT_PAD_Y: f64 = 3.0;
+
 /// Verbatim code card: mono runs, hard-broken at character level so
 /// long source lines stay inside the card — the same last-resort
 /// break prose applies to unbreakable words.
 fn layout_code(
     scene: &mut DocScene,
     source: &str,
+    highlight: &[std::ops::Range<usize>],
     x: f64,
     w: f64,
     y: f64,
@@ -598,17 +607,21 @@ fn layout_code(
     // advance comes from the active metric, not a hardcoded constant.
     let char_w = measure.width("x", base, true, false).max(1e-3);
     let max_chars = (((w - 2.0 * CODE_PAD) / char_w) as usize).max(1);
-    let mut rows: Vec<String> = Vec::new();
-    for line in source.lines() {
+    let mut rows: Vec<(usize, String)> = Vec::new();
+    for (line_idx, line) in source.lines().enumerate() {
         if line.is_empty() {
-            rows.push(String::new());
+            rows.push((line_idx, String::new()));
             continue;
         }
         let chars: Vec<char> = line.chars().collect();
         for chunk in chars.chunks(max_chars) {
-            rows.push(chunk.iter().collect());
+            rows.push((line_idx, chunk.iter().collect()));
         }
     }
+    let highlighted: Vec<bool> = rows
+        .iter()
+        .map(|(line_idx, _)| highlight.iter().any(|r| r.contains(line_idx)))
+        .collect();
     let lh = line_h(base);
     let h = rows.len() as f64 * lh + 2.0 * CODE_PAD;
     let item_start = scene.items.len();
@@ -621,7 +634,19 @@ fn layout_code(
         fill: Some(ColorRole::CodeBg),
         stroke: None,
     }));
-    for (i, row) in rows.iter().enumerate() {
+    for (i, (line_idx, row)) in rows.iter().enumerate() {
+        let _ = line_idx;
+        if highlighted[i] {
+            scene.items.push(Item::Rect(RectItem {
+                x,
+                y: y + CODE_PAD + i as f64 * lh - CODE_HIGHLIGHT_PAD_Y,
+                w,
+                h: lh + 2.0 * CODE_HIGHLIGHT_PAD_Y,
+                rounding: 2.0,
+                fill: Some(ColorRole::CodeHighlightBg),
+                stroke: None,
+            }));
+        }
         if row.is_empty() {
             continue;
         }
@@ -1366,6 +1391,7 @@ mod tests {
             &doc(vec![Block::Html(format!("<!-- {src} -->")), Block::Code {
                 lang: String::new(),
                 source: src,
+                highlight: vec![],
             }]),
             &opts(400.0),
         );
@@ -1396,7 +1422,11 @@ mod tests {
         for i in 0..40 {
             src.push_str(&format!("N{i}[Node number {i} label]-->N{}\n", i + 1));
         }
-        let block = Block::Code { lang: "mermaid".into(), source: src };
+        let block = Block::Code {
+            lang: "mermaid".into(),
+            source: src,
+            highlight: vec![],
+        };
         let sc = layout(&doc(vec![block]), &opts(720.0));
         let d = sc
             .items
@@ -1555,6 +1585,7 @@ mod tests {
             &doc(vec![Block::Code {
                 lang: "rust".into(),
                 source: "fn main() {\n    println!(\"hi\");\n}".into(),
+                highlight: vec![],
             }]),
             &opts(400.0),
         );
@@ -1569,6 +1600,46 @@ mod tests {
             assert!((t.x - (card.x + CODE_PAD)).abs() < 1e-9);
             assert!(t.y >= card.y && t.y + 21.0 <= card.y + card.h + 1e-6);
         }
+    }
+
+    #[test]
+    fn code_block_highlight_pads_wrapped_rows() {
+        let sc = layout(
+            &doc(vec![Block::Code {
+                lang: "rust".into(),
+                source: "line one\nline two\nline three\nline four".into(),
+                highlight: vec![0..1, 2..3],
+            }]),
+            &opts(400.0),
+        );
+        let runs = texts(&sc);
+        assert_eq!(runs.len(), 4);
+        let all_rects = rects(&sc);
+        let card = all_rects
+            .iter()
+            .find(|r| r.fill == Some(ColorRole::CodeBg))
+            .expect("code card");
+        let highlights: Vec<_> = all_rects
+            .iter()
+            .filter(|r| r.fill == Some(ColorRole::CodeHighlightBg))
+            .collect();
+        assert_eq!(highlights.len(), 2, "two highlighted rows expected");
+        let lh = line_h(runs[0].size);
+        for h in &highlights {
+            assert!((h.w - card.w).abs() < 1e-9, "highlight must span card width");
+            assert!(
+                (h.h - (lh + 2.0 * CODE_HIGHLIGHT_PAD_Y)).abs() < 1e-9,
+                "highlight must include vertical padding"
+            );
+        }
+        assert!(
+            (highlights[0].y - (runs[0].y - CODE_HIGHLIGHT_PAD_Y)).abs() < 1e-9,
+            "first highlight aligns with first run"
+        );
+        assert!(
+            (highlights[1].y - (runs[2].y - CODE_HIGHLIGHT_PAD_Y)).abs() < 1e-9,
+            "second highlight aligns with third run"
+        );
     }
 
     #[test]
@@ -1766,6 +1837,7 @@ mod tests {
             &doc(vec![Block::Code {
                 lang: "mermaid".into(),
                 source: "flowchart TD\nA[Start] --> B[Done]".into(),
+                highlight: vec![],
             }]),
             &opts(400.0),
         );
@@ -1800,6 +1872,7 @@ mod tests {
             &doc(vec![Block::Code {
                 lang: "mmd".into(),
                 source: "gantt\ntitle nope".into(),
+                highlight: vec![],
             }]),
             &opts(400.0),
         );
@@ -1921,6 +1994,7 @@ mod tests {
                 Block::Code {
                     lang: "".into(),
                     source: "if x < 1 && y > 2 {}".into(),
+                    highlight: vec![],
                 },
             ]),
             &opts(400.0),
@@ -1980,6 +2054,7 @@ mod tests {
             Block::Code {
                 lang: "sh".into(),
                 source: "cargo build".into(),
+                highlight: vec![],
             },
             Block::Table(Table {
                 rows: vec![vec![cell("k"), cell("v")], vec![cell("a"), cell("b")]],
@@ -1989,6 +2064,7 @@ mod tests {
             Block::Code {
                 lang: "mermaid".into(),
                 source: "flowchart LR\nA --> B".into(),
+                highlight: vec![],
             },
         ]);
         let sc = layout(&d, &opts(360.0));

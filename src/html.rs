@@ -182,7 +182,7 @@ fn block_html(out: &mut String, b: &Block, mermaid_n: &mut usize) {
             inlines_html(out, content);
             out.push_str("</p>\n");
         }
-        Block::Code { lang, source } if is_mermaid(lang) => {
+        Block::Code { lang, source, .. } if is_mermaid(lang) => {
             *mermaid_n += 1;
             match flowmaid::render_svg(source) {
                 Ok(svg) => {
@@ -199,7 +199,7 @@ fn block_html(out: &mut String, b: &Block, mermaid_n: &mut usize) {
                 }
             }
         }
-        Block::Code { lang, source } => {
+        Block::Code { lang, source, .. } => {
             if lang.is_empty() {
                 out.push_str("<pre><code>");
             } else {
@@ -429,6 +429,7 @@ mod tests {
         let html = html_of(&doc(vec![Block::Code {
             lang: "rust".into(),
             source: "let a = 1 < 2;".into(),
+            highlight: vec![],
         }]));
         assert!(html.contains("<pre><code class=\"language-rust\">let a = 1 &lt; 2;\n</code></pre>"));
     }
@@ -438,6 +439,7 @@ mod tests {
         let html = html_of(&doc(vec![Block::Code {
             lang: "".into(),
             source: "plain".into(),
+            highlight: vec![],
         }]));
         assert!(html.contains("<pre><code>plain\n</code></pre>"));
         assert!(!html.contains("language-"));
@@ -448,6 +450,7 @@ mod tests {
         let html = html_of(&doc(vec![Block::Code {
             lang: "mermaid".into(),
             source: "flowchart TD\nA[Start] --> B[Done]".into(),
+            highlight: vec![],
         }]));
         assert!(html.contains("<figure class=\"markmaid-diagram\"><svg"));
         assert!(html.contains("</figure>"));
@@ -460,10 +463,12 @@ mod tests {
             Block::Code {
                 lang: "mermaid".into(),
                 source: "flowchart TD\nA --> B".into(),
+                highlight: vec![],
             },
             Block::Code {
                 lang: "mmd".into(),
                 source: "gantt\ntitle nope".into(),
+                highlight: vec![],
             },
         ]));
         assert!(html.contains("<figure class=\"markmaid-diagram\">"));
