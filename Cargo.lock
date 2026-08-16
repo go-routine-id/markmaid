@@ -4,9 +4,9 @@ version = 3
 
 [[package]]
 name = "flowmaid"
-version = "0.17.0"
+version = "0.24.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "5aca814a4c49d35c2104e5edbe9d51f0a40110ba317604de19b555d78861c3ca"
+checksum = "f1b7c3d53b3f00ffab6fc529d10195344ceb6589d4c83cb2e9960fc141c364d5"
 
 [[package]]
 name = "markmaid"

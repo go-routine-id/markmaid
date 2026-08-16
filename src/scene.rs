@@ -13,6 +13,72 @@
 //!   [`role_color`] provides the default light-paper palette that
 //!   the SVG writer uses.
 
+/// Stored closure type for [`Measure::Custom`].
+pub type MeasureFn = std::rc::Rc<dyn Fn(&str, f64, bool, bool) -> f64>;
+
+/// How the layout measures text width. [`Measure::Estimated`] is the
+/// built-in metric (flowmaid's Helvetica table for proportional text
+/// plus a flat advance for monospace) — no font files required, so the
+/// SVG/HTML writers and any font-agnostic consumer keep working.
+/// [`Measure::Custom`] lets an interactive consumer supply real font
+/// metrics, so wrapping and inline-code chips align with the glyphs it
+/// actually paints.
+#[derive(Default, Clone)]
+pub enum Measure {
+    /// The default built-in metric.
+    #[default]
+    Estimated,
+    /// Measure with a consumer-supplied closure over `(text, size,
+    /// mono, em)` returning the advance width in layout pixels.
+    Custom(MeasureFn),
+}
+
+impl std::fmt::Debug for Measure {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Measure::Estimated => f.write_str("Estimated"),
+            Measure::Custom(_) => f.write_str("Custom(..)"),
+        }
+    }
+}
+
+impl Measure {
+    /// The default built-in metric.
+    pub fn estimated() -> Self {
+        Measure::Estimated
+    }
+
+    /// Measure with a consumer-supplied closure over `(text, size,
+    /// mono, em)` returning the advance width in layout pixels.
+    pub fn custom(f: impl Fn(&str, f64, bool, bool) -> f64 + 'static) -> Self {
+        Measure::Custom(std::rc::Rc::new(f))
+    }
+
+    /// Width of `s` at `size`, for `mono` (inline code) and `em`
+    /// (italic). `em` is ignored by the estimated metric (which never
+    /// modelled italic), but passed to a custom metric.
+    pub fn width(&self, s: &str, size: f64, mono: bool, em: bool) -> f64 {
+        match self {
+            Measure::Estimated => crate::layout::estimated_width(s, size, mono),
+            Measure::Custom(f) => f(s, size, mono, em),
+        }
+    }
+}
+
+/// How to handle a table whose natural column widths exceed the
+/// available viewport width.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub enum TableOverflow {
+    /// Shrink every column proportionally so the table still fits the
+    /// width. This is the historical default and what SVG/HTML use.
+    #[default]
+    Shrink,
+    /// Keep columns at their natural width and let the consumer clip or
+    /// scroll horizontally. Interactive consumers (e.g. egui) opt into
+    /// this.
+    Natural,
+}
+
 /// Layout inputs. `width` is the full document width including the
 /// outer margins; text wraps to fit it.
 #[derive(Debug, Clone)]
@@ -20,6 +86,10 @@ pub struct LayoutOptions {
     pub width: f64,
     /// Base font size for body text (headings scale from this).
     pub base_size: f64,
+    /// Text metric; defaults to the built-in estimate.
+    pub measure: Measure,
+    /// Table layout strategy when the table is wider than the viewport.
+    pub table_overflow: TableOverflow,
 }
 
 impl Default for LayoutOptions {
@@ -27,13 +97,16 @@ impl Default for LayoutOptions {
         LayoutOptions {
             width: 720.0,
             base_size: 14.0,
+            measure: Measure::Estimated,
+            table_overflow: TableOverflow::Shrink,
         }
     }
 }
 
 /// A laid-out document: paint `items` in order. `links` are hit-test
 /// zones for interactivity; `anchors` map headings to y offsets
-/// (tables of contents, scroll-to-section).
+/// (tables of contents, scroll-to-section); `tables` marks table item
+/// ranges that a consumer may render inside a horizontal scroll area.
 #[derive(Debug, Default)]
 pub struct DocScene {
     pub width: f64,
@@ -41,6 +114,7 @@ pub struct DocScene {
     pub items: Vec<Item>,
     pub links: Vec<LinkZone>,
     pub anchors: Vec<Anchor>,
+    pub tables: Vec<TableZone>,
 }
 
 /// One paint primitive.
@@ -137,6 +211,8 @@ pub enum DiagramView {
     Pie(flowmaid::pie::PieScene),
     Mind(flowmaid::mindmap::MindScene),
     Journey(flowmaid::journey::JourneyScene),
+    Git(flowmaid::gitgraph::GitScene),
+    Arch(flowmaid::architecture::ArchScene),
 }
 
 /// Clickable region of a link, in document coordinates.
@@ -155,6 +231,22 @@ pub struct Anchor {
     pub level: u8,
     pub text: String,
     pub y: f64,
+}
+
+/// A laid-out table that requires horizontal scrolling.
+///
+/// `x`/`y`/`h` are in document coordinates. `w` is the width the table
+/// occupies on the page; `natural_w` is the sum of the column widths
+/// plus padding, i.e. the full scroll content width. `items` indexes
+/// into [`DocScene::items`] — everything belonging to this table.
+#[derive(Debug)]
+pub struct TableZone {
+    pub x: f64,
+    pub y: f64,
+    pub w: f64,
+    pub natural_w: f64,
+    pub h: f64,
+    pub items: std::ops::Range<usize>,
 }
 
 /// Semantic color slots. Consumers map these to their theme;
