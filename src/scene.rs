@@ -106,7 +106,8 @@ impl Default for LayoutOptions {
 /// A laid-out document: paint `items` in order. `links` are hit-test
 /// zones for interactivity; `anchors` map headings to y offsets
 /// (tables of contents, scroll-to-section); `tables` marks table item
-/// ranges that a consumer may render inside a horizontal scroll area.
+/// ranges that a consumer may render inside a horizontal scroll area;
+/// `code_blocks` carries verbatim source for copy/select UX.
 #[derive(Debug, Default)]
 pub struct DocScene {
     pub width: f64,
@@ -115,6 +116,7 @@ pub struct DocScene {
     pub links: Vec<LinkZone>,
     pub anchors: Vec<Anchor>,
     pub tables: Vec<TableZone>,
+    pub code_blocks: Vec<CodeBlockZone>,
 }
 
 /// One paint primitive.
@@ -246,6 +248,19 @@ pub struct TableZone {
     pub w: f64,
     pub natural_w: f64,
     pub h: f64,
+    pub items: std::ops::Range<usize>,
+}
+
+/// A laid-out code block (fenced ``` or raw HTML) that a consumer may
+/// render with copy/select interactivity. `source` is the original
+/// verbatim text; `items` is the painted geometry range.
+#[derive(Debug)]
+pub struct CodeBlockZone {
+    pub x: f64,
+    pub y: f64,
+    pub w: f64,
+    pub h: f64,
+    pub source: String,
     pub items: std::ops::Range<usize>,
 }
 

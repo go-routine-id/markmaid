@@ -18,8 +18,8 @@
 
 use crate::model::{Block, Doc, Inline, List, Table};
 use crate::scene::{
-    role_color, Anchor, ColorRole, DiagramItem, DiagramView, DocScene, ImageItem, Item,
-    LayoutOptions, LineItem, LinkZone, Measure, RectItem, TableOverflow, TableZone, TextRun,
+    role_color, Anchor, CodeBlockZone, ColorRole, DiagramItem, DiagramView, DocScene, ImageItem,
+    Item, LayoutOptions, LineItem, LinkZone, Measure, RectItem, TableOverflow, TableZone, TextRun,
 };
 use flowmaid::model::Document;
 
@@ -611,6 +611,7 @@ fn layout_code(
     }
     let lh = line_h(base);
     let h = rows.len() as f64 * lh + 2.0 * CODE_PAD;
+    let item_start = scene.items.len();
     scene.items.push(Item::Rect(RectItem {
         x,
         y,
@@ -637,6 +638,14 @@ fn layout_code(
             text: row.clone(),
         }));
     }
+    scene.code_blocks.push(CodeBlockZone {
+        x,
+        y,
+        w,
+        h,
+        source: source.to_string(),
+        items: item_start..scene.items.len(),
+    });
     y + h
 }
 
