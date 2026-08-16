@@ -13,5 +13,4 @@ repository = "https://github.com/go-routine-id/markmaid"
 [dependencies]
 # Satu-satunya dependency adalah keluarga sendiri: engine diagram
 # flowmaid (zero-dep) — blok ```mermaid menjadi geometri inline.
-# 0.17 = layout dagre-faithful + subgraph border-node clusters & label slots.
-flowmaid = "0.17"
+flowmaid = "0.24"

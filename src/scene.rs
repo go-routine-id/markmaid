@@ -13,6 +13,57 @@
 //!   [`role_color`] provides the default light-paper palette that
 //!   the SVG writer uses.
 
+/// How the layout measures text width. [`Measure::Estimated`] is the
+/// built-in metric (flowmaid's Helvetica table for proportional text
+/// plus a flat advance for monospace) — no font files required, so the
+/// SVG/HTML writers and any font-agnostic consumer keep working.
+/// [`Measure::Custom`] lets an interactive consumer supply real font
+/// metrics, so wrapping and inline-code chips align with the glyphs it
+/// actually paints.
+#[derive(Clone)]
+pub enum Measure {
+    Estimated,
+    Custom(std::rc::Rc<dyn Fn(&str, f64, bool, bool) -> f64>),
+}
+
+impl std::fmt::Debug for Measure {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Measure::Estimated => f.write_str("Estimated"),
+            Measure::Custom(_) => f.write_str("Custom(..)"),
+        }
+    }
+}
+
+impl Default for Measure {
+    fn default() -> Self {
+        Measure::Estimated
+    }
+}
+
+impl Measure {
+    /// The default built-in metric.
+    pub fn estimated() -> Self {
+        Measure::Estimated
+    }
+
+    /// Measure with a consumer-supplied closure over `(text, size,
+    /// mono, em)` returning the advance width in layout pixels.
+    pub fn custom(f: impl Fn(&str, f64, bool, bool) -> f64 + 'static) -> Self {
+        Measure::Custom(std::rc::Rc::new(f))
+    }
+
+    /// Width of `s` at `size`, for `mono` (inline code) and `em`
+    /// (italic). `em` is ignored by the estimated metric (which never
+    /// modelled italic), but passed to a custom metric.
+    pub fn width(&self, s: &str, size: f64, mono: bool, em: bool) -> f64 {
+        match self {
+            Measure::Estimated => crate::layout::estimated_width(s, size, mono),
+            Measure::Custom(f) => f(s, size, mono, em),
+        }
+    }
+}
+
 /// Layout inputs. `width` is the full document width including the
 /// outer margins; text wraps to fit it.
 #[derive(Debug, Clone)]
@@ -20,6 +71,8 @@ pub struct LayoutOptions {
     pub width: f64,
     /// Base font size for body text (headings scale from this).
     pub base_size: f64,
+    /// Text metric; defaults to the built-in estimate.
+    pub measure: Measure,
 }
 
 impl Default for LayoutOptions {
@@ -27,6 +80,7 @@ impl Default for LayoutOptions {
         LayoutOptions {
             width: 720.0,
             base_size: 14.0,
+            measure: Measure::Estimated,
         }
     }
 }
@@ -137,6 +191,8 @@ pub enum DiagramView {
     Pie(flowmaid::pie::PieScene),
     Mind(flowmaid::mindmap::MindScene),
     Journey(flowmaid::journey::JourneyScene),
+    Git(flowmaid::gitgraph::GitScene),
+    Arch(flowmaid::architecture::ArchScene),
 }
 
 /// Clickable region of a link, in document coordinates.
