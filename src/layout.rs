@@ -7,16 +7,19 @@
 //! this stage diverges from a real renderer:
 //! - code lines are hard-broken at character level to stay inside
 //!   the code card (real renderers scroll or overflow instead);
-//! - table cells are single-line and never truncated; a table wider
-//!   than the column keeps its frame inside the page by narrowing
-//!   every column proportionally, so cell text may overflow;
+//! - table cells are single-line and never truncated; by default a
+//!   table wider than the column narrows every column proportionally,
+//!   while interactive consumers may opt into `TableOverflow::Natural`
+//!   to keep columns at their natural width and scroll horizontally;
 //! - an unbreakable word wider than the column is hard-broken at
 //!   character level (real renderers overflow instead).
+
+#![allow(clippy::too_many_arguments)]
 
 use crate::model::{Block, Doc, Inline, List, Table};
 use crate::scene::{
     role_color, Anchor, ColorRole, DiagramItem, DiagramView, DocScene, ImageItem, Item,
-    LayoutOptions, LineItem, LinkZone, Measure, RectItem, TextRun,
+    LayoutOptions, LineItem, LinkZone, Measure, RectItem, TableOverflow, TableZone, TextRun,
 };
 use flowmaid::model::Document;
 
@@ -453,6 +456,7 @@ pub fn layout(doc: &Doc, opts: &LayoutOptions) -> DocScene {
         MARGIN,
         opts.base_size,
         &opts.measure,
+        opts.table_overflow,
     );
     scene.height = end + MARGIN;
     scene
@@ -489,12 +493,13 @@ fn layout_blocks(
     mut y: f64,
     base: f64,
     measure: &Measure,
+    table_overflow: TableOverflow,
 ) -> f64 {
     for (i, b) in blocks.iter().enumerate() {
         if i > 0 {
             y += space_before(b);
         }
-        y = layout_block(scene, b, x, w, y, base, measure);
+        y = layout_block(scene, b, x, w, y, base, measure, table_overflow);
         if i + 1 < blocks.len() {
             y += space_after(b);
         }
@@ -514,6 +519,7 @@ fn layout_block(
     y: f64,
     base: f64,
     measure: &Measure,
+    table_overflow: TableOverflow,
 ) -> f64 {
     match b {
         Block::Heading { level, content } => {
@@ -528,9 +534,9 @@ fn layout_block(
         Block::Code { source, .. } => layout_code(scene, source, x, w, y, base, measure),
         // Raw HTML is shown verbatim as code — never interpreted.
         Block::Html(source) => layout_code(scene, source, x, w, y, base, measure),
-        Block::Quote(blocks) => layout_quote(scene, blocks, x, w, y, base, measure),
-        Block::List(list) => layout_list(scene, list, x, w, y, base, measure),
-        Block::Table(table) => layout_table(scene, table, x, w, y, base, measure),
+        Block::Quote(blocks) => layout_quote(scene, blocks, x, w, y, base, measure, table_overflow),
+        Block::List(list) => layout_list(scene, list, x, w, y, base, measure, table_overflow),
+        Block::Table(table) => layout_table(scene, table, x, w, y, base, measure, table_overflow),
         Block::Rule => {
             scene.items.push(Item::Line(LineItem {
                 x1: x,
@@ -645,6 +651,7 @@ fn layout_quote(
     y: f64,
     base: f64,
     measure: &Measure,
+    table_overflow: TableOverflow,
 ) -> f64 {
     let idx = scene.items.len();
     let inner_end = layout_blocks(
@@ -655,6 +662,7 @@ fn layout_quote(
         y + QUOTE_PAD,
         base,
         measure,
+        table_overflow,
     );
     let h = (inner_end + QUOTE_PAD) - y;
     scene.items.insert(
@@ -692,6 +700,7 @@ fn layout_list(
     y: f64,
     base: f64,
     measure: &Measure,
+    table_overflow: TableOverflow,
 ) -> f64 {
     let lh = line_h(base);
     let mut y = y;
@@ -757,6 +766,7 @@ fn layout_list(
             y,
             base,
             measure,
+            table_overflow,
         );
         // Never end above the marker's own line.
         y = end.max(y + lh);
@@ -772,12 +782,16 @@ fn layout_table(
     y: f64,
     base: f64,
     measure: &Measure,
+    table_overflow: TableOverflow,
 ) -> f64 {
     let rows = &table.rows;
     if rows.is_empty() || rows[0].is_empty() {
         return y;
     }
     let ncols = rows[0].len();
+    // Capture the item range so a Natural-width table can be rendered
+    // inside a horizontal scroll area by the consumer.
+    let item_start = scene.items.len();
     // Measure: every cell as one unwrapped line.
     let mut cells: Vec<Vec<Vec<Frag>>> = Vec::with_capacity(rows.len());
     let mut colw = vec![CELL_MIN_W; ncols];
@@ -794,16 +808,21 @@ fn layout_table(
         }
         cells.push(frow);
     }
-    // Keep the frame on the page: narrow all columns proportionally
-    // when the natural width exceeds the column (cells may overflow).
     let natural: f64 = colw.iter().sum();
-    if natural > w {
-        let f = w / natural;
-        for cw in &mut colw {
-            *cw *= f;
+    // Shrink keeps the frame on the page (SVG/HTML default). Natural
+    // preserves column widths and lets the consumer scroll horizontally.
+    let (total_w, scroll_w) = match table_overflow {
+        TableOverflow::Shrink => {
+            if natural > w {
+                let f = w / natural;
+                for cw in &mut colw {
+                    *cw *= f;
+                }
+            }
+            (colw.iter().sum::<f64>(), 0.0)
         }
-    }
-    let total_w: f64 = colw.iter().sum();
+        TableOverflow::Natural => (natural, natural),
+    };
     let row_h = line_h(base) + CELL_PAD_Y;
     let total_h = rows.len() as f64 * row_h;
 
@@ -858,6 +877,16 @@ fn layout_table(
             emit_line(scene, frags, cx + CELL_PAD_X / 2.0, ty, base, role, strong);
             cx += colw[c];
         }
+    }
+    if table_overflow == TableOverflow::Natural && scroll_w > w {
+        scene.tables.push(TableZone {
+            x,
+            y,
+            w,
+            natural_w: scroll_w,
+            h: total_h,
+            items: item_start..scene.items.len(),
+        });
     }
     y + total_h
 }
@@ -1185,6 +1214,7 @@ mod tests {
             width,
             base_size: 14.0,
             measure: Measure::Estimated,
+            table_overflow: TableOverflow::Shrink,
         }
     }
 
@@ -1533,6 +1563,39 @@ mod tests {
     }
 
     #[test]
+    fn natural_table_keeps_columns_and_reports_zone() {
+        let cell = |s: &str| vec![Inline::plain(s)];
+        let long = "a very long header cell that will not fit";
+        let mut opts = opts(300.0);
+        opts.table_overflow = TableOverflow::Natural;
+        let sc = layout(
+            &doc(vec![Block::Table(Table {
+                rows: vec![
+                    vec![cell(long), cell(long), cell(long)],
+                    vec![cell("x"), cell("y"), cell("z")],
+                ],
+            })]),
+            &opts,
+        );
+        assert_eq!(sc.tables.len(), 1);
+        let z = &sc.tables[0];
+        assert!(z.natural_w > z.w, "natural width exceeds viewport");
+        assert!(z.items.start < z.items.end, "items range is non-empty");
+        // Column separators should reach the natural width, not the viewport.
+        let rightmost = sc
+            .items
+            .iter()
+            .filter_map(|i| match i {
+                Item::Line(l) if l.x1 == l.x2 => Some(l.y2),
+                _ => None,
+            })
+            .fold(0.0, f64::max);
+        assert!((rightmost - z.y - z.h).abs() < 1e-9);
+        // The scene width stays the page width, but the table items overflow.
+        assert!((sc.width - 300.0).abs() < 1e-9);
+    }
+
+    #[test]
     fn table_emits_rectangular_grid_and_strong_header() {
         let cell = |s: &str| vec![Inline::plain(s)];
         let sc = layout(
@@ -1822,6 +1885,7 @@ mod tests {
             width: 300.0,
             base_size: 14.0,
             measure,
+            table_overflow: TableOverflow::Shrink,
         };
         let sc = layout(
             &doc(vec![Block::Paragraph(vec![
