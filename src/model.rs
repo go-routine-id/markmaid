@@ -17,9 +17,15 @@ pub enum Block {
     Heading { level: u8, content: Vec<Inline> },
     Paragraph(Vec<Inline>),
     /// Fenced code (``` or ~~~). `lang` is the info string's first
-    /// word, lowercased ("" when absent). Mermaid blocks are plain
-    /// `Code` here — the LAYOUT stage turns them into diagrams.
-    Code { lang: String, source: String },
+    /// word, lowercased ("" when absent). `highlight` is a list of
+    /// 1-based line ranges to highlight, stored as half-open 0-based
+    /// ranges. Mermaid blocks are plain `Code` here — the LAYOUT stage
+    /// turns them into diagrams.
+    Code {
+        lang: String,
+        source: String,
+        highlight: Vec<std::ops::Range<usize>>,
+    },
     /// `>` block quote; contains full blocks recursively.
     Quote(Vec<Block>),
     List(List),

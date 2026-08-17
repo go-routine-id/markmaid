@@ -41,7 +41,7 @@ fn parse_blocks(lines: &[&str]) -> Vec<Block> {
         }
 
         // Fenced code.
-        if let Some((ch, open_len, lang)) = fence_open(line) {
+        if let Some((ch, open_len, lang, highlight)) = fence_open(line) {
             let mut body = Vec::new();
             let mut j = i + 1;
             while j < lines.len() && !fence_close(lines[j].trim_start(), ch, open_len) {
@@ -51,6 +51,7 @@ fn parse_blocks(lines: &[&str]) -> Vec<Block> {
             out.push(Block::Code {
                 lang,
                 source: body.join("\n"),
+                highlight,
             });
             i = if j < lines.len() { j + 1 } else { j };
             continue;
@@ -172,7 +173,7 @@ fn parse_blocks(lines: &[&str]) -> Vec<Block> {
 
 /// Opening code fence (three-or-more backticks or tildes) →
 /// (fence char, run length, lowercased first info word).
-fn fence_open(line: &str) -> Option<(char, usize, String)> {
+fn fence_open(line: &str) -> Option<(char, usize, String, Vec<std::ops::Range<usize>>)> {
     let ch = line.chars().next()?;
     if ch != '`' && ch != '~' {
         return None;
@@ -186,12 +187,34 @@ fn fence_open(line: &str) -> Option<(char, usize, String)> {
     if ch == '`' && info.contains('`') {
         return None;
     }
-    let lang = info
-        .split_whitespace()
-        .next()
-        .unwrap_or("")
-        .to_lowercase();
-    Some((ch, run, lang))
+    let mut parts = info.split_whitespace();
+    let lang = parts.next().unwrap_or("").to_lowercase();
+    let mut highlight = Vec::new();
+    for token in parts {
+        if let Some(inner) = token.strip_prefix('{').and_then(|s| s.strip_suffix('}')) {
+            for piece in inner.split(',') {
+                let piece = piece.trim();
+                if piece.is_empty() {
+                    continue;
+                }
+                if let Some((a, b)) = piece.split_once('-') {
+                    let start: usize = a.trim().parse().ok()?;
+                    let end: usize = b.trim().parse().ok()?;
+                    if start == 0 || end < start {
+                        continue;
+                    }
+                    highlight.push(start - 1..end);
+                } else {
+                    let n: usize = piece.parse().ok()?;
+                    if n == 0 {
+                        continue;
+                    }
+                    highlight.push(n - 1..n);
+                }
+            }
+        }
+    }
+    Some((ch, run, lang, highlight))
 }
 
 fn fence_close(line: &str, ch: char, open_len: usize) -> bool {
@@ -848,12 +871,26 @@ mod tests {
     fn fences_backtick_tilde_info_and_unclosed() {
         let d = parse("```rust ignore\nfn x() {}\n```\n~~~\nplain\n~~~\n```\nunclosed");
         assert!(
-            matches!(&d.blocks[0], Block::Code { lang, source } if lang == "rust" && source == "fn x() {}")
+            matches!(&d.blocks[0], Block::Code { lang, source, .. } if lang == "rust" && source == "fn x() {}")
         );
         assert!(
-            matches!(&d.blocks[1], Block::Code { lang, source } if lang.is_empty() && source == "plain")
+            matches!(&d.blocks[1], Block::Code { lang, source, .. } if lang.is_empty() && source == "plain")
         );
         assert!(matches!(&d.blocks[2], Block::Code { source, .. } if source == "unclosed"));
+    }
+
+    #[test]
+    fn fence_info_highlight_ranges() {
+        let d = parse("```rust {1,3-5}\nline1\nline2\nline3\nline4\nline5\n```");
+        let Block::Code { lang, source, highlight } = &d.blocks[0] else { panic!("expected code block") };
+        assert_eq!(lang, "rust");
+        assert_eq!(source, "line1\nline2\nline3\nline4\nline5");
+        assert_eq!(highlight, &vec![0..1, 2..5]);
+
+        // Invalid / reversed / zero ranges are ignored.
+        let d = parse("``` {0,2-1}\nfoo\nbar\n```");
+        let Block::Code { highlight, .. } = &d.blocks[0] else { panic!() };
+        assert!(highlight.is_empty());
     }
 
     #[test]

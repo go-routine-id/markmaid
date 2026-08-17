@@ -5,18 +5,21 @@
 //! width table, no font files): close enough for pleasant reading
 //! layouts, not for pixel-perfect typography. Honest notes on where
 //! this stage diverges from a real renderer:
-//! - code blocks never wrap: long source lines overrun the code
-//!   card (and possibly the page);
-//! - table cells are single-line and never truncated; a table wider
-//!   than the column keeps its frame inside the page by narrowing
-//!   every column proportionally, so cell text may overflow;
+//! - code lines are hard-broken at character level to stay inside
+//!   the code card (real renderers scroll or overflow instead);
+//! - table cells are single-line and never truncated; by default a
+//!   table wider than the column narrows every column proportionally,
+//!   while interactive consumers may opt into `TableOverflow::Natural`
+//!   to keep columns at their natural width and scroll horizontally;
 //! - an unbreakable word wider than the column is hard-broken at
 //!   character level (real renderers overflow instead).
 
+#![allow(clippy::too_many_arguments)]
+
 use crate::model::{Block, Doc, Inline, List, Table};
 use crate::scene::{
-    role_color, Anchor, ColorRole, DiagramItem, DiagramView, DocScene, ImageItem, Item,
-    LayoutOptions, LineItem, LinkZone, RectItem, TextRun,
+    role_color, Anchor, CodeBlockZone, ColorRole, DiagramItem, DiagramView, DocScene, ImageItem,
+    Item, LayoutOptions, LineItem, LinkZone, Measure, RectItem, TableOverflow, TableZone, TextRun,
 };
 use flowmaid::model::Document;
 
@@ -53,10 +56,10 @@ const BLOCK_SPACE: f64 = 8.0;
 const RULE_SPACE: f64 = 10.0;
 /// Line-box height as a multiple of the font size.
 const LINE_HEIGHT: f64 = 1.5;
-/// Monospace advance as a fraction of the font size.
-const MONO_ADVANCE: f64 = 0.62;
-/// flowmaid's proportional width table is calibrated at this size.
-const FLOWMAID_CALIBRATION: f64 = 13.0;
+/// Monospace advance as a fraction of the font size — the value
+/// shared by the common fixed-width families (Hack, Menlo, DejaVu
+/// Sans Mono all advance ~0.602 em).
+const MONO_ADVANCE: f64 = 0.602;
 /// Indent per list nesting level; vertical gap between items.
 const LIST_INDENT: f64 = 18.0;
 const LIST_GAP: f64 = 3.0;
@@ -64,8 +67,8 @@ const LIST_GAP: f64 = 3.0;
 const CHECKBOX_SIZE: f64 = 13.0;
 const CHECKBOX_FILL: f64 = 7.0;
 /// Inline code chip: padding around the fragment, corner rounding.
-const CHIP_PAD: f64 = 3.0;
-const CHIP_ROUND: f64 = 3.0;
+const CHIP_PAD: f64 = 1.0;
+const CHIP_ROUND: f64 = 2.0;
 /// Block quote: horizontal content inset, vertical padding, accent
 /// bar width.
 const QUOTE_INSET: f64 = 14.0;
@@ -84,14 +87,15 @@ const DIAGRAM_PAD: f64 = 12.0;
 // ── Text metrics ────────────────────────────────────────────────────
 
 /// Estimated width of `s` at `size` px. Proportional text reuses
-/// flowmaid's per-character table (calibrated at 13 px); monospace
-/// is a flat advance per char. Both are additive per character, so
-/// a fragment re-measures to exactly the sum of its pieces.
-fn text_w(s: &str, size: f64, mono: bool) -> f64 {
+/// flowmaid's per-character table, rescaled from the calibration
+/// size the engine publishes; monospace is a flat advance per char.
+/// Both are additive per character, so a fragment re-measures to
+/// exactly the sum of its pieces.
+pub(crate) fn estimated_width(s: &str, size: f64, mono: bool) -> f64 {
     if mono {
         MONO_ADVANCE * size * s.chars().count() as f64
     } else {
-        flowmaid::layout::text_width(s) * size / FLOWMAID_CALIBRATION
+        flowmaid::layout::text_width(s) * size / flowmaid::layout::TEXT_CALIBRATION
     }
 }
 
@@ -177,8 +181,15 @@ struct Frag {
 /// previous fragment when the style matches and there is no gap —
 /// this is what yields ONE TextRun per contiguous same-style
 /// stretch of a line.
-fn push_piece(line: &mut Vec<Frag>, cx: &mut f64, text: &str, style: &RunStyle, size: f64) {
-    let pw = text_w(text, size, style.code);
+fn push_piece(
+    line: &mut Vec<Frag>,
+    cx: &mut f64,
+    text: &str,
+    style: &RunStyle,
+    size: f64,
+    measure: &Measure,
+) {
+    let pw = measure.width(text, size, style.code, style.em);
     if let Some(last) = line.last_mut() {
         if last.style.as_ref() == Some(style) && (last.x + last.w - *cx).abs() < 1e-9 {
             last.text.push_str(text);
@@ -199,7 +210,7 @@ fn push_piece(line: &mut Vec<Frag>, cx: &mut f64, text: &str, style: &RunStyle, 
 /// Greedy word wrap of `toks` into the column `[x, x + w)`. A word
 /// wider than the whole column is hard-broken at character level so
 /// no fragment ever escapes the column.
-fn wrap_frags(toks: &[Tok], x: f64, w: f64, size: f64) -> Vec<Vec<Frag>> {
+fn wrap_frags(toks: &[Tok], x: f64, w: f64, size: f64, measure: &Measure) -> Vec<Vec<Frag>> {
     let right = x + w;
     let mut lines: Vec<Vec<Frag>> = Vec::new();
     let mut line: Vec<Frag> = Vec::new();
@@ -213,7 +224,10 @@ fn wrap_frags(toks: &[Tok], x: f64, w: f64, size: f64) -> Vec<Vec<Frag>> {
             }
             Tok::Word(pieces) => pieces,
         };
-        let ww: f64 = pieces.iter().map(|(t, st)| text_w(t, size, st.code)).sum();
+        let ww: f64 = pieces
+            .iter()
+            .map(|(t, st)| measure.width(t, size, st.code, st.em))
+            .sum();
         if let Some(prev) = line.last() {
             // Mid-line: a space joins this word to the previous one.
             // Same style on both sides -> the space lives inside the
@@ -222,18 +236,18 @@ fn wrap_frags(toks: &[Tok], x: f64, w: f64, size: f64) -> Vec<Vec<Frag>> {
             let prev_style = prev.style.clone().expect("placed frag has style");
             let same = prev_style == pieces[0].1;
             let sw = if same {
-                text_w(" ", size, prev_style.code)
+                measure.width(" ", size, prev_style.code, prev_style.em)
             } else {
-                text_w(" ", size, false)
+                measure.width(" ", size, false, false)
             };
             if cx + sw + ww <= right + 1e-6 {
                 if same {
-                    push_piece(&mut line, &mut cx, " ", &prev_style, size);
+                    push_piece(&mut line, &mut cx, " ", &prev_style, size, measure);
                 } else {
                     cx += sw;
                 }
                 for (t, st) in pieces {
-                    push_piece(&mut line, &mut cx, t, st, size);
+                    push_piece(&mut line, &mut cx, t, st, size, measure);
                 }
                 continue;
             }
@@ -243,18 +257,18 @@ fn wrap_frags(toks: &[Tok], x: f64, w: f64, size: f64) -> Vec<Vec<Frag>> {
         // At line start.
         if ww <= w + 1e-6 {
             for (t, st) in pieces {
-                push_piece(&mut line, &mut cx, t, st, size);
+                push_piece(&mut line, &mut cx, t, st, size, measure);
             }
         } else {
             // Overlong word: break at character level.
             for (t, st) in pieces {
                 for ch in t.chars() {
-                    let cw = text_w(ch.encode_utf8(&mut [0u8; 4]), size, st.code);
+                    let cw = measure.width(ch.encode_utf8(&mut [0u8; 4]), size, st.code, st.em);
                     if cx + cw > right + 1e-6 && !line.is_empty() {
                         lines.push(std::mem::take(&mut line));
                         cx = x;
                     }
-                    push_piece(&mut line, &mut cx, ch.encode_utf8(&mut [0u8; 4]), st, size);
+                    push_piece(&mut line, &mut cx, ch.encode_utf8(&mut [0u8; 4]), st, size, measure);
                 }
             }
         }
@@ -289,7 +303,7 @@ fn emit_line(
                 x: dx + f.x - CHIP_PAD,
                 y: y + 0.1 * size - CHIP_PAD,
                 w: f.w + 2.0 * CHIP_PAD,
-                h: 0.9 * size + 2.0 * CHIP_PAD,
+                h: 0.85 * size + 2.0 * CHIP_PAD,
                 rounding: CHIP_ROUND,
                 fill: Some(ColorRole::CodeBg),
                 stroke: None,
@@ -343,6 +357,7 @@ fn layout_inlines(
     size: f64,
     base_role: ColorRole,
     force_strong: bool,
+    measure: &Measure,
 ) -> f64 {
     let mut y = y;
     // Images are replaced elements: split the run stream at each
@@ -355,7 +370,7 @@ fn layout_inlines(
         }
         let toks = tokenize(seg);
         let mut yy = y;
-        for line in wrap_frags(&toks, x, w, size) {
+        for line in wrap_frags(&toks, x, w, size, measure) {
             emit_line(scene, line, 0.0, yy, size, base_role, force_strong);
             yy += line_h(size);
         }
@@ -393,7 +408,7 @@ fn layout_image(scene: &mut DocScene, src: &str, alt: &str, x: f64, w: f64, y: f
 
 /// Inline content as a single unwrapped line of fragments measured
 /// at origin 0 — table cells. Hard breaks become spaces.
-fn line_frags(inlines: &[Inline], size: f64) -> Vec<Frag> {
+fn line_frags(inlines: &[Inline], size: f64, measure: &Measure) -> Vec<Frag> {
     let clean: Vec<Inline> = inlines
         .iter()
         .map(|r| Inline {
@@ -402,7 +417,7 @@ fn line_frags(inlines: &[Inline], size: f64) -> Vec<Frag> {
         })
         .collect();
     let toks = tokenize(&clean);
-    wrap_frags(&toks, 0.0, f64::INFINITY, size)
+    wrap_frags(&toks, 0.0, f64::INFINITY, size, measure)
         .pop()
         .unwrap_or_default()
 }
@@ -433,7 +448,16 @@ pub fn layout(doc: &Doc, opts: &LayoutOptions) -> DocScene {
     };
     scene.width = width;
     let col = width - 2.0 * MARGIN;
-    let end = layout_blocks(&mut scene, &doc.blocks, MARGIN, col, MARGIN, opts.base_size);
+    let end = layout_blocks(
+        &mut scene,
+        &doc.blocks,
+        MARGIN,
+        col,
+        MARGIN,
+        opts.base_size,
+        &opts.measure,
+        opts.table_overflow,
+    );
     scene.height = end + MARGIN;
     scene
 }
@@ -468,12 +492,14 @@ fn layout_blocks(
     w: f64,
     mut y: f64,
     base: f64,
+    measure: &Measure,
+    table_overflow: TableOverflow,
 ) -> f64 {
     for (i, b) in blocks.iter().enumerate() {
         if i > 0 {
             y += space_before(b);
         }
-        y = layout_block(scene, b, x, w, y, base);
+        y = layout_block(scene, b, x, w, y, base, measure, table_overflow);
         if i + 1 < blocks.len() {
             y += space_after(b);
         }
@@ -485,19 +511,37 @@ fn is_mermaid(lang: &str) -> bool {
     lang == "mermaid" || lang == "mmd"
 }
 
-fn layout_block(scene: &mut DocScene, b: &Block, x: f64, w: f64, y: f64, base: f64) -> f64 {
+fn layout_block(
+    scene: &mut DocScene,
+    b: &Block,
+    x: f64,
+    w: f64,
+    y: f64,
+    base: f64,
+    measure: &Measure,
+    table_overflow: TableOverflow,
+) -> f64 {
     match b {
-        Block::Heading { level, content } => layout_heading(scene, *level, content, x, w, y, base),
-        Block::Paragraph(inls) => layout_inlines(scene, inls, x, w, y, base, ColorRole::Text, false),
-        Block::Code { lang, source } if is_mermaid(lang) => {
-            layout_mermaid(scene, source, x, w, y, base)
+        Block::Heading { level, content } => {
+            layout_heading(scene, *level, content, x, w, y, base, measure)
         }
-        Block::Code { source, .. } => layout_code(scene, source, x, w, y, base),
+        Block::Paragraph(inls) => {
+            layout_inlines(scene, inls, x, w, y, base, ColorRole::Text, false, measure)
+        }
+        Block::Code { lang, source, highlight } if is_mermaid(lang) => {
+            layout_mermaid(scene, source, x, w, y, base, measure)
+        }
+        Block::Code {
+            lang,
+            source,
+            highlight,
+            ..
+        } => layout_code(scene, lang, source, highlight, x, w, y, base, measure),
         // Raw HTML is shown verbatim as code — never interpreted.
-        Block::Html(source) => layout_code(scene, source, x, w, y, base),
-        Block::Quote(blocks) => layout_quote(scene, blocks, x, w, y, base),
-        Block::List(list) => layout_list(scene, list, x, w, y, base),
-        Block::Table(table) => layout_table(scene, table, x, w, y, base),
+        Block::Html(source) => layout_code(scene, "", source, &[], x, w, y, base, measure),
+        Block::Quote(blocks) => layout_quote(scene, blocks, x, w, y, base, measure, table_overflow),
+        Block::List(list) => layout_list(scene, list, x, w, y, base, measure, table_overflow),
+        Block::Table(table) => layout_table(scene, table, x, w, y, base, measure, table_overflow),
         Block::Rule => {
             scene.items.push(Item::Line(LineItem {
                 x1: x,
@@ -519,6 +563,7 @@ fn layout_heading(
     w: f64,
     y: f64,
     base: f64,
+    measure: &Measure,
 ) -> f64 {
     let level = level.clamp(1, 6);
     let size = base * HEADING_SCALE[(level - 1) as usize];
@@ -527,7 +572,7 @@ fn layout_heading(
         text: plain_text(content),
         y,
     });
-    let mut end = layout_inlines(scene, content, x, w, y, size, ColorRole::Strong, true);
+    let mut end = layout_inlines(scene, content, x, w, y, size, ColorRole::Strong, true, measure);
     if level <= 2 {
         end += HEAD_RULE_GAP;
         scene.items.push(Item::Line(LineItem {
@@ -541,11 +586,80 @@ fn layout_heading(
     end
 }
 
-/// Verbatim code card: one mono run per source line, no wrapping.
-fn layout_code(scene: &mut DocScene, source: &str, x: f64, w: f64, y: f64, base: f64) -> f64 {
-    let lines: Vec<&str> = source.lines().collect();
+/// Vertical padding around a highlighted code block line, so the
+/// highlight background does not touch neighbouring unhighlighted text.
+const CODE_HIGHLIGHT_PAD_Y: f64 = 3.0;
+
+/// Verbatim code card: mono runs, hard-broken at character level so
+/// long source lines stay inside the card — the same last-resort
+/// break prose applies to unbreakable words.
+fn layout_code(
+    scene: &mut DocScene,
+    lang: &str,
+    source: &str,
+    highlight: &[std::ops::Range<usize>],
+    x: f64,
+    w: f64,
+    y: f64,
+    base: f64,
+    measure: &Measure,
+) -> f64 {
+    // `lang` is only consumed when the syntax-tree-sitter feature is on.
+    let _ = lang;
+    // Widest run that fits the card interior; at least one char so a
+    // pathologically narrow column still makes progress. The per-char
+    // advance comes from the active metric, not a hardcoded constant.
+    let char_w = measure.width("x", base, true, false).max(1e-3);
+    let max_chars = (((w - 2.0 * CODE_PAD) / char_w) as usize).max(1);
     let lh = line_h(base);
-    let h = lines.len() as f64 * lh + 2.0 * CODE_PAD;
+
+    #[cfg(feature = "syntax-tree-sitter")]
+    let spans = crate::highlight::code_spans(source, lang);
+    #[cfg(not(feature = "syntax-tree-sitter"))]
+    let spans: Option<Vec<(std::ops::Range<usize>, ColorRole)>> = None;
+    let spans_ref = spans.as_deref();
+
+    let mut rows: Vec<CodeRow> = Vec::new();
+    let mut cursor: usize = 0;
+    for (line_idx, line_with_nl) in source.split_inclusive('\n').enumerate() {
+        let nl_len = if line_with_nl.ends_with("\r\n") {
+            2
+        } else if line_with_nl.ends_with('\n') {
+            1
+        } else {
+            0
+        };
+        let content = &line_with_nl[..line_with_nl.len() - nl_len];
+        let line_start = cursor;
+        if content.is_empty() {
+            rows.push(CodeRow {
+                line_idx,
+                text: String::new(),
+                byte_start: line_start,
+                byte_end: line_start,
+            });
+        } else {
+            let chars: Vec<(usize, char)> = content.char_indices().collect();
+            for chunk in chars.chunks(max_chars) {
+                let local_start = chunk[0].0;
+                let local_end = chunk
+                    .last()
+                    .map(|(off, c)| off + c.len_utf8())
+                    .unwrap_or(content.len());
+                let text: String = chunk.iter().map(|(_, c)| *c).collect();
+                rows.push(CodeRow {
+                    line_idx,
+                    text,
+                    byte_start: line_start + local_start,
+                    byte_end: line_start + local_end,
+                });
+            }
+        }
+        cursor += line_with_nl.len();
+    }
+
+    let h = rows.len() as f64 * lh + 2.0 * CODE_PAD;
+    let item_start = scene.items.len();
     scene.items.push(Item::Rect(RectItem {
         x,
         y,
@@ -555,30 +669,130 @@ fn layout_code(scene: &mut DocScene, source: &str, x: f64, w: f64, y: f64, base:
         fill: Some(ColorRole::CodeBg),
         stroke: None,
     }));
-    for (i, line) in lines.iter().enumerate() {
-        if line.is_empty() {
+
+    for (i, row) in rows.iter().enumerate() {
+        if highlight.iter().any(|r| r.contains(&row.line_idx)) {
+            scene.items.push(Item::Rect(RectItem {
+                x,
+                y: y + CODE_PAD + i as f64 * lh - CODE_HIGHLIGHT_PAD_Y,
+                w,
+                h: lh + 2.0 * CODE_HIGHLIGHT_PAD_Y,
+                rounding: 2.0,
+                fill: Some(ColorRole::CodeHighlightBg),
+                stroke: None,
+            }));
+        }
+        if row.text.is_empty() {
             continue;
         }
-        scene.items.push(Item::Text(TextRun {
-            x: x + CODE_PAD,
-            y: y + CODE_PAD + i as f64 * lh,
-            size: base,
-            mono: true,
-            strong: false,
-            em: false,
-            strike: false,
-            underline: false,
-            role: ColorRole::CodeText,
-            text: (*line).to_string(),
-        }));
+        let fragments = code_row_fragments(row, spans_ref);
+        let mut px = x + CODE_PAD;
+        for (text, role) in fragments {
+            let ww = measure.width(&text, base, true, false);
+            scene.items.push(Item::Text(TextRun {
+                x: px,
+                y: y + CODE_PAD + i as f64 * lh,
+                size: base,
+                mono: true,
+                strong: false,
+                em: false,
+                strike: false,
+                underline: false,
+                role,
+                text,
+            }));
+            px += ww;
+        }
     }
+    scene.code_blocks.push(CodeBlockZone {
+        x,
+        y,
+        w,
+        h,
+        source: source.to_string(),
+        items: item_start..scene.items.len(),
+    });
     y + h
+}
+
+struct CodeRow {
+    line_idx: usize,
+    text: String,
+    byte_start: usize,
+    byte_end: usize,
+}
+
+fn code_row_fragments(
+    row: &CodeRow,
+    spans: Option<&[(std::ops::Range<usize>, ColorRole)]>,
+) -> Vec<(String, ColorRole)> {
+    let mut frags: Vec<(String, ColorRole)> = Vec::new();
+    if let Some(spans) = spans {
+        let mut pos = row.byte_start;
+        for (range, role) in spans {
+            if range.end <= row.byte_start || range.start >= row.byte_end {
+                continue;
+            }
+            if range.start > pos {
+                let s = row
+                    .text
+                    .get(pos - row.byte_start..range.start - row.byte_start)
+                    .unwrap_or("");
+                if !s.is_empty() {
+                    frags.push((s.to_string(), ColorRole::CodeText));
+                }
+            }
+            let start = range.start.max(row.byte_start);
+            let end = range.end.min(row.byte_end);
+            let s = row
+                .text
+                .get(start - row.byte_start..end - row.byte_start)
+                .unwrap_or("");
+            if !s.is_empty() {
+                frags.push((s.to_string(), *role));
+            }
+            pos = end;
+        }
+        if pos < row.byte_end {
+            let s = row
+                .text
+                .get(pos - row.byte_start..row.byte_end - row.byte_start)
+                .unwrap_or("");
+            if !s.is_empty() {
+                frags.push((s.to_string(), ColorRole::CodeText));
+            }
+        }
+    } else {
+        frags.push((row.text.clone(), ColorRole::CodeText));
+    }
+
+    // Merge adjacent fragments with the same role so we emit fewer TextRuns.
+    let mut merged: Vec<(String, ColorRole)> = Vec::new();
+    for (text, role) in frags {
+        if let Some((last_text, last_role)) = merged.last_mut() {
+            if *last_role == role {
+                last_text.push_str(&text);
+                continue;
+            }
+        }
+        merged.push((text, role));
+    }
+    merged
 }
 
 /// Block quote: content inset on a QuoteBg card with a Link-colored
 /// accent bar down the left edge. The card rects are inserted
 /// behind the already-laid-out content.
-fn layout_quote(scene: &mut DocScene, blocks: &[Block], x: f64, w: f64, y: f64, base: f64) -> f64 {
+fn layout_quote(
+    scene: &mut DocScene,
+    blocks: &[Block],
+    x: f64,
+    w: f64,
+    y: f64,
+    base: f64,
+    measure: &Measure,
+    table_overflow: TableOverflow,
+) -> f64 {
     let idx = scene.items.len();
     let inner_end = layout_blocks(
         scene,
@@ -587,6 +801,8 @@ fn layout_quote(scene: &mut DocScene, blocks: &[Block], x: f64, w: f64, y: f64, 
         (w - 2.0 * QUOTE_INSET).max(1.0),
         y + QUOTE_PAD,
         base,
+        measure,
+        table_overflow,
     );
     let h = (inner_end + QUOTE_PAD) - y;
     scene.items.insert(
@@ -616,7 +832,16 @@ fn layout_quote(scene: &mut DocScene, blocks: &[Block], x: f64, w: f64, y: f64, 
     y + h
 }
 
-fn layout_list(scene: &mut DocScene, list: &List, x: f64, w: f64, y: f64, base: f64) -> f64 {
+fn layout_list(
+    scene: &mut DocScene,
+    list: &List,
+    x: f64,
+    w: f64,
+    y: f64,
+    base: f64,
+    measure: &Measure,
+    table_overflow: TableOverflow,
+) -> f64 {
     let lh = line_h(base);
     let mut y = y;
     for (i, item) in list.items.iter().enumerate() {
@@ -680,6 +905,8 @@ fn layout_list(scene: &mut DocScene, list: &List, x: f64, w: f64, y: f64, base: 
             (w - indent).max(MIN_LIST_CONTENT),
             y,
             base,
+            measure,
+            table_overflow,
         );
         // Never end above the marker's own line.
         y = end.max(y + lh);
@@ -687,35 +914,55 @@ fn layout_list(scene: &mut DocScene, list: &List, x: f64, w: f64, y: f64, base: 
     y
 }
 
-fn layout_table(scene: &mut DocScene, table: &Table, x: f64, w: f64, y: f64, base: f64) -> f64 {
+fn layout_table(
+    scene: &mut DocScene,
+    table: &Table,
+    x: f64,
+    w: f64,
+    y: f64,
+    base: f64,
+    measure: &Measure,
+    table_overflow: TableOverflow,
+) -> f64 {
     let rows = &table.rows;
     if rows.is_empty() || rows[0].is_empty() {
         return y;
     }
     let ncols = rows[0].len();
+    // Capture the item range so a Natural-width table can be rendered
+    // inside a horizontal scroll area by the consumer.
+    let item_start = scene.items.len();
     // Measure: every cell as one unwrapped line.
     let mut cells: Vec<Vec<Vec<Frag>>> = Vec::with_capacity(rows.len());
     let mut colw = vec![CELL_MIN_W; ncols];
     for row in rows {
         let mut frow = Vec::with_capacity(ncols);
         for c in 0..ncols {
-            let frags = row.get(c).map(|cell| line_frags(cell, base)).unwrap_or_default();
+            let frags = row
+                .get(c)
+                .map(|cell| line_frags(cell, base, measure))
+                .unwrap_or_default();
             let tw = frags.last().map(|f| f.x + f.w).unwrap_or(0.0);
             colw[c] = colw[c].max(tw + CELL_PAD_X);
             frow.push(frags);
         }
         cells.push(frow);
     }
-    // Keep the frame on the page: narrow all columns proportionally
-    // when the natural width exceeds the column (cells may overflow).
     let natural: f64 = colw.iter().sum();
-    if natural > w {
-        let f = w / natural;
-        for cw in &mut colw {
-            *cw *= f;
+    // Shrink keeps the frame on the page (SVG/HTML default). Natural
+    // preserves column widths and lets the consumer scroll horizontally.
+    let (total_w, scroll_w) = match table_overflow {
+        TableOverflow::Shrink => {
+            if natural > w {
+                let f = w / natural;
+                for cw in &mut colw {
+                    *cw *= f;
+                }
+            }
+            (colw.iter().sum::<f64>(), 0.0)
         }
-    }
-    let total_w: f64 = colw.iter().sum();
+        TableOverflow::Natural => (natural, natural),
+    };
     let row_h = line_h(base) + CELL_PAD_Y;
     let total_h = rows.len() as f64 * row_h;
 
@@ -771,6 +1018,16 @@ fn layout_table(scene: &mut DocScene, table: &Table, x: f64, w: f64, y: f64, bas
             cx += colw[c];
         }
     }
+    if table_overflow == TableOverflow::Natural && scroll_w > w {
+        scene.tables.push(TableZone {
+            x,
+            y,
+            w,
+            natural_w: scroll_w,
+            h: total_h,
+            items: item_start..scene.items.len(),
+        });
+    }
     y + total_h
 }
 
@@ -780,10 +1037,18 @@ fn layout_table(scene: &mut DocScene, table: &Table, x: f64, w: f64, y: f64, bas
 /// on a white card, scaled down (never up) to fit the column. A
 /// parse error becomes a red card with the line-numbered message —
 /// the document keeps rendering.
-fn layout_mermaid(scene: &mut DocScene, source: &str, x: f64, w: f64, y: f64, base: f64) -> f64 {
+fn layout_mermaid(
+    scene: &mut DocScene,
+    source: &str,
+    x: f64,
+    w: f64,
+    y: f64,
+    base: f64,
+    measure: &Measure,
+) -> f64 {
     let parsed = match flowmaid::parser::parse_document(source) {
         Ok(p) => p,
-        Err(e) => return layout_mermaid_error(scene, &e.to_string(), x, w, y, base),
+        Err(e) => return layout_mermaid_error(scene, &e.to_string(), x, w, y, base, measure),
     };
     let (size, view) = match parsed {
         Document::Flowchart(g) | Document::State(g) => {
@@ -813,6 +1078,17 @@ fn layout_mermaid(scene: &mut DocScene, source: &str, x: f64, w: f64, y: f64, ba
         Document::Journey(d) => {
             let js = flowmaid::journey::scene(&d);
             ((js.width, js.height), DiagramView::Journey(js))
+        }
+        // Static, auto-laid-out diagrams: expose their generic `Scene`
+        // (node/edge/cluster geometry) exactly like pie/sequence do —
+        // the SVG writer's extra labels are layered on later in to_svg.
+        Document::GitGraph(d) => {
+            let gs = flowmaid::gitgraph::scene(&d);
+            ((gs.scene.width, gs.scene.height), DiagramView::Git(gs))
+        }
+        Document::Architecture(d) => {
+            let as_ = flowmaid::architecture::scene(&d);
+            ((as_.scene.width, as_.scene.height), DiagramView::Arch(as_))
         }
     };
     // Fit-to-width, shrinking as far as needed (no lower clamp — a
@@ -854,11 +1130,13 @@ fn layout_mermaid_error(
     w: f64,
     y: f64,
     base: f64,
+    measure: &Measure,
 ) -> f64 {
     let msg = format!("mermaid: {}", message);
     let lh = line_h(base);
     // Naive character wrap at the column (mono metric).
-    let max_chars = (((w - 2.0 * CODE_PAD) / (MONO_ADVANCE * base)) as usize).max(1);
+    let char_w = measure.width("x", base, true, false).max(1e-3);
+    let max_chars = (((w - 2.0 * CODE_PAD) / char_w) as usize).max(1);
     let mut lines: Vec<String> = Vec::new();
     let mut cur = String::new();
     for (i, ch) in msg.chars().enumerate() {
@@ -996,6 +1274,8 @@ pub(crate) fn doc_to_svg(scene: &DocScene) -> String {
                     DiagramView::Pie(ps) => flowmaid::pie::to_svg(ps),
                     DiagramView::Mind(ms) => flowmaid::mindmap::to_svg(ms),
                     DiagramView::Journey(js) => flowmaid::journey::to_svg(js),
+                    DiagramView::Git(gs) => flowmaid::gitgraph::to_svg(gs),
+                    DiagramView::Arch(as_) => flowmaid::architecture::to_svg(as_),
                 };
                 // Strip the writer's outer <svg> element and re-wrap
                 // as a nested <svg>: the viewBox scales the content
@@ -1073,6 +1353,8 @@ mod tests {
         LayoutOptions {
             width,
             base_size: 14.0,
+            measure: Measure::Estimated,
+            table_overflow: TableOverflow::Shrink,
         }
     }
 
@@ -1195,7 +1477,7 @@ mod tests {
         }
         let sc = layout(&doc(vec![nest(20)]), &opts(300.0));
         for t in texts(&sc) {
-            let w = text_w(&t.text, t.size, t.mono);
+            let w = estimated_width(&t.text, t.size, t.mono);
             assert!(
                 t.x + w <= sc.width + 0.5,
                 "marker/text '{}' at x={} overflows width {}",
@@ -1207,6 +1489,38 @@ mod tests {
     }
 
     #[test]
+    fn long_code_lines_wrap_inside_the_card() {
+        // A 300-char line (an HTML comment gets the same treatment
+        // via Block::Html → layout_code) used to overrun card and page.
+        let src = format!("short\n\n{}", "x".repeat(300));
+        let sc = layout(
+            &doc(vec![Block::Html(format!("<!-- {src} -->")), Block::Code {
+                lang: String::new(),
+                source: src,
+                highlight: vec![],
+            }]),
+            &opts(400.0),
+        );
+        assert_within(&sc);
+        let runs = texts(&sc);
+        assert!(runs.len() > 4, "long lines must split into rows");
+        for t in &runs {
+            let w = estimated_width(&t.text, t.size, t.mono);
+            assert!(
+                t.x + w <= sc.width + 0.5,
+                "code row '{}' overflows width {}",
+                t.text,
+                sc.width
+            );
+        }
+        // Every row sits inside its card: the deepest run still ends
+        // above the bottom of the deepest card rect.
+        let bottom = rects(&sc).iter().map(|r| r.y + r.h).fold(0.0, f64::max);
+        let deepest = runs.iter().map(|t| t.y + line_h(t.size)).fold(0.0, f64::max);
+        assert!(deepest <= bottom + 1e-9, "run below card: {deepest} > {bottom}");
+    }
+
+    #[test]
     fn very_wide_diagram_fits_its_card() {
         // A flowchart of many nodes in one row is very wide; it must
         // shrink to fit, not overflow at a 0.01 floor.
@@ -1214,7 +1528,11 @@ mod tests {
         for i in 0..40 {
             src.push_str(&format!("N{i}[Node number {i} label]-->N{}\n", i + 1));
         }
-        let block = Block::Code { lang: "mermaid".into(), source: src };
+        let block = Block::Code {
+            lang: "mermaid".into(),
+            source: src,
+            highlight: vec![],
+        };
         let sc = layout(&doc(vec![block]), &opts(720.0));
         let d = sc
             .items
@@ -1240,7 +1558,7 @@ mod tests {
         assert!(ys.len() >= 3, "expected several lines, got {}", ys.len());
         for t in &ts {
             assert!(t.x >= MARGIN - 1e-6);
-            let w = text_w(&t.text, t.size, t.mono);
+            let w = estimated_width(&t.text, t.size, t.mono);
             assert!(
                 t.x + w <= 240.0 - MARGIN + 0.5,
                 "run '{}' overflows: {} > {}",
@@ -1338,7 +1656,7 @@ mod tests {
         assert_eq!(run.role, ColorRole::Link);
         assert!((z.x - run.x).abs() < 1e-9);
         assert!((z.y - run.y).abs() < 1e-9);
-        assert!((z.w - text_w("docs", 14.0, false)).abs() < 1e-6);
+        assert!((z.w - estimated_width("docs", 14.0, false)).abs() < 1e-6);
         assert!((z.h - 21.0).abs() < 1e-9);
     }
 
@@ -1362,7 +1680,7 @@ mod tests {
             .find(|r| r.fill == Some(ColorRole::CodeBg))
             .expect("chip");
         assert!((chip.x - (run.x - CHIP_PAD)).abs() < 1e-9);
-        let w = text_w("cargo test", 14.0, true);
+        let w = estimated_width("cargo test", 14.0, true);
         assert!((chip.w - (w + 2.0 * CHIP_PAD)).abs() < 1e-6);
         assert!((chip.rounding - CHIP_ROUND).abs() < 1e-9);
     }
@@ -1371,8 +1689,9 @@ mod tests {
     fn code_block_rect_contains_all_runs() {
         let sc = layout(
             &doc(vec![Block::Code {
-                lang: "rust".into(),
+                lang: "".into(),
                 source: "fn main() {\n    println!(\"hi\");\n}".into(),
+                highlight: vec![],
             }]),
             &opts(400.0),
         );
@@ -1387,6 +1706,101 @@ mod tests {
             assert!((t.x - (card.x + CODE_PAD)).abs() < 1e-9);
             assert!(t.y >= card.y && t.y + 21.0 <= card.y + card.h + 1e-6);
         }
+    }
+
+    #[test]
+    #[cfg(feature = "syntax-tree-sitter")]
+    fn rust_code_block_emits_syntax_roles() {
+        let sc = layout(
+            &doc(vec![Block::Code {
+                lang: "rust".into(),
+                source: "fn main() {\n    let x = 42;\n}".into(),
+                highlight: vec![],
+            }]),
+            &opts(400.0),
+        );
+        let roles: Vec<_> = texts(&sc).iter().map(|t| t.role).collect();
+        assert!(
+            roles.contains(&ColorRole::CodeKeyword),
+            "expected keyword role in rust code block"
+        );
+        assert!(
+            roles.contains(&ColorRole::CodeFunction),
+            "expected function role in rust code block"
+        );
+    }
+
+    #[test]
+    fn code_block_highlight_pads_wrapped_rows() {
+        let sc = layout(
+            &doc(vec![Block::Code {
+                lang: "rust".into(),
+                source: "line one\nline two\nline three\nline four".into(),
+                highlight: vec![0..1, 2..3],
+            }]),
+            &opts(400.0),
+        );
+        let runs = texts(&sc);
+        assert_eq!(runs.len(), 4);
+        let all_rects = rects(&sc);
+        let card = all_rects
+            .iter()
+            .find(|r| r.fill == Some(ColorRole::CodeBg))
+            .expect("code card");
+        let highlights: Vec<_> = all_rects
+            .iter()
+            .filter(|r| r.fill == Some(ColorRole::CodeHighlightBg))
+            .collect();
+        assert_eq!(highlights.len(), 2, "two highlighted rows expected");
+        let lh = line_h(runs[0].size);
+        for h in &highlights {
+            assert!((h.w - card.w).abs() < 1e-9, "highlight must span card width");
+            assert!(
+                (h.h - (lh + 2.0 * CODE_HIGHLIGHT_PAD_Y)).abs() < 1e-9,
+                "highlight must include vertical padding"
+            );
+        }
+        assert!(
+            (highlights[0].y - (runs[0].y - CODE_HIGHLIGHT_PAD_Y)).abs() < 1e-9,
+            "first highlight aligns with first run"
+        );
+        assert!(
+            (highlights[1].y - (runs[2].y - CODE_HIGHLIGHT_PAD_Y)).abs() < 1e-9,
+            "second highlight aligns with third run"
+        );
+    }
+
+    #[test]
+    fn natural_table_keeps_columns_and_reports_zone() {
+        let cell = |s: &str| vec![Inline::plain(s)];
+        let long = "a very long header cell that will not fit";
+        let mut opts = opts(300.0);
+        opts.table_overflow = TableOverflow::Natural;
+        let sc = layout(
+            &doc(vec![Block::Table(Table {
+                rows: vec![
+                    vec![cell(long), cell(long), cell(long)],
+                    vec![cell("x"), cell("y"), cell("z")],
+                ],
+            })]),
+            &opts,
+        );
+        assert_eq!(sc.tables.len(), 1);
+        let z = &sc.tables[0];
+        assert!(z.natural_w > z.w, "natural width exceeds viewport");
+        assert!(z.items.start < z.items.end, "items range is non-empty");
+        // Column separators should reach the natural width, not the viewport.
+        let rightmost = sc
+            .items
+            .iter()
+            .filter_map(|i| match i {
+                Item::Line(l) if l.x1 == l.x2 => Some(l.y2),
+                _ => None,
+            })
+            .fold(0.0, f64::max);
+        assert!((rightmost - z.y - z.h).abs() < 1e-9);
+        // The scene width stays the page width, but the table items overflow.
+        assert!((sc.width - 300.0).abs() < 1e-9);
     }
 
     #[test]
@@ -1551,6 +1965,7 @@ mod tests {
             &doc(vec![Block::Code {
                 lang: "mermaid".into(),
                 source: "flowchart TD\nA[Start] --> B[Done]".into(),
+                highlight: vec![],
             }]),
             &opts(400.0),
         );
@@ -1585,6 +2000,7 @@ mod tests {
             &doc(vec![Block::Code {
                 lang: "mmd".into(),
                 source: "gantt\ntitle nope".into(),
+                highlight: vec![],
             }]),
             &opts(400.0),
         );
@@ -1637,7 +2053,7 @@ mod tests {
         assert!(ts.len() >= 2);
         for t in ts {
             assert!((t.x - MARGIN).abs() < 1e-9);
-            assert!(t.x + text_w(&t.text, t.size, t.mono) <= 200.0 - MARGIN + 0.5);
+            assert!(t.x + estimated_width(&t.text, t.size, t.mono) <= 200.0 - MARGIN + 0.5);
         }
     }
 
@@ -1651,10 +2067,51 @@ mod tests {
 
     #[test]
     fn metrics_are_additive() {
-        assert!((text_w("abc", 14.0, true) - 0.62 * 14.0 * 3.0).abs() < 1e-9);
-        let ab = text_w("ab", 14.0, false);
-        assert!((ab - text_w("a", 14.0, false) - text_w("b", 14.0, false)).abs() < 1e-9);
+        assert!((estimated_width("abc", 14.0, true) - MONO_ADVANCE * 14.0 * 3.0).abs() < 1e-9);
+        let ab = estimated_width("ab", 14.0, false);
+        assert!((ab - estimated_width("a", 14.0, false) - estimated_width("b", 14.0, false)).abs() < 1e-9);
         assert_eq!(line_h(14.0), 21.0);
+    }
+
+    #[test]
+    fn custom_measure_drives_wrap_and_em() {
+        // A custom metric that reports every glyph as 10px wide and
+        // (recorded for the assert) forwards the em flag for italic
+        // spans. Thirty glyphs at 10px = 300px, wider than the 252px
+        // column, so it wraps — whereas the ~7px/glyph estimate would
+        // keep it on one line. Proves the consumer metric really
+        // drives the wrap decision.
+        let saw_em = std::rc::Rc::new(std::cell::Cell::new(false));
+        let flag = saw_em.clone();
+        let measure = Measure::custom(move |s, size, mono, em| {
+            if em {
+                flag.set(true);
+            }
+            assert!(!mono, "prose is never mono");
+            assert!((size - 14.0).abs() < 1e-9);
+            s.chars().count() as f64 * 10.0
+        });
+        let opts = LayoutOptions {
+            width: 300.0,
+            base_size: 14.0,
+            measure,
+            table_overflow: TableOverflow::Shrink,
+        };
+        let sc = layout(
+            &doc(vec![Block::Paragraph(vec![
+                Inline::plain("aaaaaaaaaaaaaaaaaaaaaaaabbbb"),
+                styled("bb", |i| i.em = true),
+            ])]),
+            &opts,
+        );
+        let mut ys: Vec<i64> = texts(&sc).iter().map(|t| (t.y * 10.0) as i64).collect();
+        ys.sort();
+        ys.dedup();
+        assert!(ys.len() >= 2, "custom metric must force a wrap, got {} line(s)", ys.len());
+        assert!(saw_em.get(), "custom metric must see the em flag");
+        let runs = texts(&sc);
+        let italic = runs.iter().find(|t| t.text == "bb").expect("italic run");
+        assert!(italic.em);
     }
 
     #[test]
@@ -1665,6 +2122,7 @@ mod tests {
                 Block::Code {
                     lang: "".into(),
                     source: "if x < 1 && y > 2 {}".into(),
+                    highlight: vec![],
                 },
             ]),
             &opts(400.0),
@@ -1724,6 +2182,7 @@ mod tests {
             Block::Code {
                 lang: "sh".into(),
                 source: "cargo build".into(),
+                highlight: vec![],
             },
             Block::Table(Table {
                 rows: vec![vec![cell("k"), cell("v")], vec![cell("a"), cell("b")]],
@@ -1733,6 +2192,7 @@ mod tests {
             Block::Code {
                 lang: "mermaid".into(),
                 source: "flowchart LR\nA --> B".into(),
+                highlight: vec![],
             },
         ]);
         let sc = layout(&d, &opts(360.0));
@@ -1740,7 +2200,7 @@ mod tests {
         for t in texts(&sc) {
             assert!(t.x >= -1e-6);
             assert!(
-                t.x + text_w(&t.text, t.size, t.mono) <= sc.width + 0.5,
+                t.x + estimated_width(&t.text, t.size, t.mono) <= sc.width + 0.5,
                 "run '{}' escapes the page",
                 t.text
             );
