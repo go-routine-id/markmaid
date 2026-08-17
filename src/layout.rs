@@ -532,12 +532,13 @@ fn layout_block(
             layout_mermaid(scene, source, x, w, y, base, measure)
         }
         Block::Code {
+            lang,
             source,
             highlight,
             ..
-        } => layout_code(scene, source, highlight, x, w, y, base, measure),
+        } => layout_code(scene, lang, source, highlight, x, w, y, base, measure),
         // Raw HTML is shown verbatim as code — never interpreted.
-        Block::Html(source) => layout_code(scene, source, &[], x, w, y, base, measure),
+        Block::Html(source) => layout_code(scene, "", source, &[], x, w, y, base, measure),
         Block::Quote(blocks) => layout_quote(scene, blocks, x, w, y, base, measure, table_overflow),
         Block::List(list) => layout_list(scene, list, x, w, y, base, measure, table_overflow),
         Block::Table(table) => layout_table(scene, table, x, w, y, base, measure, table_overflow),
@@ -594,6 +595,7 @@ const CODE_HIGHLIGHT_PAD_Y: f64 = 3.0;
 /// break prose applies to unbreakable words.
 fn layout_code(
     scene: &mut DocScene,
+    lang: &str,
     source: &str,
     highlight: &[std::ops::Range<usize>],
     x: f64,
@@ -602,27 +604,60 @@ fn layout_code(
     base: f64,
     measure: &Measure,
 ) -> f64 {
+    // `lang` is only consumed when the syntax-tree-sitter feature is on.
+    let _ = lang;
     // Widest run that fits the card interior; at least one char so a
     // pathologically narrow column still makes progress. The per-char
     // advance comes from the active metric, not a hardcoded constant.
     let char_w = measure.width("x", base, true, false).max(1e-3);
     let max_chars = (((w - 2.0 * CODE_PAD) / char_w) as usize).max(1);
-    let mut rows: Vec<(usize, String)> = Vec::new();
-    for (line_idx, line) in source.lines().enumerate() {
-        if line.is_empty() {
-            rows.push((line_idx, String::new()));
-            continue;
-        }
-        let chars: Vec<char> = line.chars().collect();
-        for chunk in chars.chunks(max_chars) {
-            rows.push((line_idx, chunk.iter().collect()));
-        }
-    }
-    let highlighted: Vec<bool> = rows
-        .iter()
-        .map(|(line_idx, _)| highlight.iter().any(|r| r.contains(line_idx)))
-        .collect();
     let lh = line_h(base);
+
+    #[cfg(feature = "syntax-tree-sitter")]
+    let spans = crate::highlight::code_spans(source, lang);
+    #[cfg(not(feature = "syntax-tree-sitter"))]
+    let spans: Option<Vec<(std::ops::Range<usize>, ColorRole)>> = None;
+    let spans_ref = spans.as_deref();
+
+    let mut rows: Vec<CodeRow> = Vec::new();
+    let mut cursor: usize = 0;
+    for (line_idx, line_with_nl) in source.split_inclusive('\n').enumerate() {
+        let nl_len = if line_with_nl.ends_with("\r\n") {
+            2
+        } else if line_with_nl.ends_with('\n') {
+            1
+        } else {
+            0
+        };
+        let content = &line_with_nl[..line_with_nl.len() - nl_len];
+        let line_start = cursor;
+        if content.is_empty() {
+            rows.push(CodeRow {
+                line_idx,
+                text: String::new(),
+                byte_start: line_start,
+                byte_end: line_start,
+            });
+        } else {
+            let chars: Vec<(usize, char)> = content.char_indices().collect();
+            for chunk in chars.chunks(max_chars) {
+                let local_start = chunk[0].0;
+                let local_end = chunk
+                    .last()
+                    .map(|(off, c)| off + c.len_utf8())
+                    .unwrap_or(content.len());
+                let text: String = chunk.iter().map(|(_, c)| *c).collect();
+                rows.push(CodeRow {
+                    line_idx,
+                    text,
+                    byte_start: line_start + local_start,
+                    byte_end: line_start + local_end,
+                });
+            }
+        }
+        cursor += line_with_nl.len();
+    }
+
     let h = rows.len() as f64 * lh + 2.0 * CODE_PAD;
     let item_start = scene.items.len();
     scene.items.push(Item::Rect(RectItem {
@@ -634,9 +669,9 @@ fn layout_code(
         fill: Some(ColorRole::CodeBg),
         stroke: None,
     }));
-    for (i, (line_idx, row)) in rows.iter().enumerate() {
-        let _ = line_idx;
-        if highlighted[i] {
+
+    for (i, row) in rows.iter().enumerate() {
+        if highlight.iter().any(|r| r.contains(&row.line_idx)) {
             scene.items.push(Item::Rect(RectItem {
                 x,
                 y: y + CODE_PAD + i as f64 * lh - CODE_HIGHLIGHT_PAD_Y,
@@ -647,21 +682,27 @@ fn layout_code(
                 stroke: None,
             }));
         }
-        if row.is_empty() {
+        if row.text.is_empty() {
             continue;
         }
-        scene.items.push(Item::Text(TextRun {
-            x: x + CODE_PAD,
-            y: y + CODE_PAD + i as f64 * lh,
-            size: base,
-            mono: true,
-            strong: false,
-            em: false,
-            strike: false,
-            underline: false,
-            role: ColorRole::CodeText,
-            text: row.clone(),
-        }));
+        let fragments = code_row_fragments(row, spans_ref);
+        let mut px = x + CODE_PAD;
+        for (text, role) in fragments {
+            let ww = measure.width(&text, base, true, false);
+            scene.items.push(Item::Text(TextRun {
+                x: px,
+                y: y + CODE_PAD + i as f64 * lh,
+                size: base,
+                mono: true,
+                strong: false,
+                em: false,
+                strike: false,
+                underline: false,
+                role,
+                text,
+            }));
+            px += ww;
+        }
     }
     scene.code_blocks.push(CodeBlockZone {
         x,
@@ -672,6 +713,71 @@ fn layout_code(
         items: item_start..scene.items.len(),
     });
     y + h
+}
+
+struct CodeRow {
+    line_idx: usize,
+    text: String,
+    byte_start: usize,
+    byte_end: usize,
+}
+
+fn code_row_fragments(
+    row: &CodeRow,
+    spans: Option<&[(std::ops::Range<usize>, ColorRole)]>,
+) -> Vec<(String, ColorRole)> {
+    let mut frags: Vec<(String, ColorRole)> = Vec::new();
+    if let Some(spans) = spans {
+        let mut pos = row.byte_start;
+        for (range, role) in spans {
+            if range.end <= row.byte_start || range.start >= row.byte_end {
+                continue;
+            }
+            if range.start > pos {
+                let s = row
+                    .text
+                    .get(pos - row.byte_start..range.start - row.byte_start)
+                    .unwrap_or("");
+                if !s.is_empty() {
+                    frags.push((s.to_string(), ColorRole::CodeText));
+                }
+            }
+            let start = range.start.max(row.byte_start);
+            let end = range.end.min(row.byte_end);
+            let s = row
+                .text
+                .get(start - row.byte_start..end - row.byte_start)
+                .unwrap_or("");
+            if !s.is_empty() {
+                frags.push((s.to_string(), *role));
+            }
+            pos = end;
+        }
+        if pos < row.byte_end {
+            let s = row
+                .text
+                .get(pos - row.byte_start..row.byte_end - row.byte_start)
+                .unwrap_or("");
+            if !s.is_empty() {
+                frags.push((s.to_string(), ColorRole::CodeText));
+            }
+        }
+    } else {
+        frags.push((row.text.clone(), ColorRole::CodeText));
+    }
+
+    // Merge adjacent fragments with the same role so we emit fewer TextRuns.
+    let mut merged: Vec<(String, ColorRole)> = Vec::new();
+    for (text, role) in frags {
+        if let Some((last_text, last_role)) = merged.last_mut() {
+            if *last_role == role {
+                last_text.push_str(&text);
+                continue;
+            }
+        }
+        merged.push((text, role));
+    }
+    merged
 }
 
 /// Block quote: content inset on a QuoteBg card with a Link-colored
@@ -1583,7 +1689,7 @@ mod tests {
     fn code_block_rect_contains_all_runs() {
         let sc = layout(
             &doc(vec![Block::Code {
-                lang: "rust".into(),
+                lang: "".into(),
                 source: "fn main() {\n    println!(\"hi\");\n}".into(),
                 highlight: vec![],
             }]),
@@ -1600,6 +1706,28 @@ mod tests {
             assert!((t.x - (card.x + CODE_PAD)).abs() < 1e-9);
             assert!(t.y >= card.y && t.y + 21.0 <= card.y + card.h + 1e-6);
         }
+    }
+
+    #[test]
+    #[cfg(feature = "syntax-tree-sitter")]
+    fn rust_code_block_emits_syntax_roles() {
+        let sc = layout(
+            &doc(vec![Block::Code {
+                lang: "rust".into(),
+                source: "fn main() {\n    let x = 42;\n}".into(),
+                highlight: vec![],
+            }]),
+            &opts(400.0),
+        );
+        let roles: Vec<_> = texts(&sc).iter().map(|t| t.role).collect();
+        assert!(
+            roles.contains(&ColorRole::CodeKeyword),
+            "expected keyword role in rust code block"
+        );
+        assert!(
+            roles.contains(&ColorRole::CodeFunction),
+            "expected function role in rust code block"
+        );
     }
 
     #[test]

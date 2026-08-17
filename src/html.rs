@@ -199,18 +199,7 @@ fn block_html(out: &mut String, b: &Block, mermaid_n: &mut usize) {
                 }
             }
         }
-        Block::Code { lang, source, .. } => {
-            if lang.is_empty() {
-                out.push_str("<pre><code>");
-            } else {
-                out.push_str(&format!("<pre><code class=\"language-{}\">", esc_attr(lang)));
-            }
-            out.push_str(&esc_text(source));
-            if !source.is_empty() && !source.ends_with('\n') {
-                out.push('\n');
-            }
-            out.push_str("</code></pre>\n");
-        }
+        Block::Code { lang, source, .. } => code_block_html(out, lang, source),
         Block::Quote(blocks) => {
             out.push_str("<blockquote>\n");
             for b in blocks {
@@ -229,6 +218,46 @@ fn block_html(out: &mut String, b: &Block, mermaid_n: &mut usize) {
             out.push_str("</code></pre>\n");
         }
     }
+}
+
+/// Emit a fenced code block or raw-HTML block as escaped HTML.
+/// When the `syntax-tree-sitter` feature is enabled and the language is
+/// supported, each token is wrapped in a `<span style="color:#...">`.
+fn code_block_html(out: &mut String, lang: &str, source: &str) {
+    #[cfg(feature = "syntax-tree-sitter")]
+    let spans = crate::highlight::code_spans(source, lang);
+    #[cfg(not(feature = "syntax-tree-sitter"))]
+    let spans: Option<Vec<(std::ops::Range<usize>, crate::scene::ColorRole)>> = None;
+
+    if lang.is_empty() {
+        out.push_str("<pre><code>");
+    } else {
+        out.push_str(&format!("<pre><code class=\"language-{}\">", esc_attr(lang)));
+    }
+
+    if let Some(spans) = spans {
+        let mut pos = 0;
+        for (range, role) in &spans {
+            if range.start > pos {
+                out.push_str(&esc_text(&source[pos..range.start]));
+            }
+            let color = crate::scene::role_color(*role);
+            out.push_str(&format!("<span style=\"color:{};\">", color));
+            out.push_str(&esc_text(&source[range.clone()]));
+            out.push_str("</span>");
+            pos = range.end;
+        }
+        if pos < source.len() {
+            out.push_str(&esc_text(&source[pos..]));
+        }
+    } else {
+        out.push_str(&esc_text(source));
+    }
+
+    if !source.is_empty() && !source.ends_with('\n') {
+        out.push('\n');
+    }
+    out.push_str("</code></pre>\n");
 }
 
 fn list_html(out: &mut String, list: &List, mermaid_n: &mut usize) {
@@ -431,7 +460,11 @@ mod tests {
             source: "let a = 1 < 2;".into(),
             highlight: vec![],
         }]));
+        assert!(html.contains(r#"class="language-rust""#));
+        #[cfg(not(feature = "syntax-tree-sitter"))]
         assert!(html.contains("<pre><code class=\"language-rust\">let a = 1 &lt; 2;\n</code></pre>"));
+        #[cfg(feature = "syntax-tree-sitter")]
+        assert!(html.contains(r#"<span style="color:#d73a49;">let</span>"#));
     }
 
     #[test]
@@ -443,6 +476,21 @@ mod tests {
         }]));
         assert!(html.contains("<pre><code>plain\n</code></pre>"));
         assert!(!html.contains("language-"));
+    }
+
+    #[test]
+    #[cfg(feature = "syntax-tree-sitter")]
+    fn rust_code_block_html_has_colored_spans() {
+        let html = html_of(&doc(vec![Block::Code {
+            lang: "rust".into(),
+            source: "fn main() {}".into(),
+            highlight: vec![],
+        }]));
+        assert!(
+            html.contains(r#"<span style="color:#d73a49;">fn</span>"#),
+            "expected keyword span in: {}",
+            html
+        );
     }
 
     #[test]

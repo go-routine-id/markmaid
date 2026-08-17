@@ -28,6 +28,8 @@
 //! family) — mermaid fences become embedded diagram geometry.
 
 pub mod blocks;
+#[cfg(feature = "syntax-tree-sitter")]
+pub mod highlight;
 pub mod html;
 pub mod layout;
 pub mod model;
