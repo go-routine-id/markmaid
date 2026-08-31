@@ -2,6 +2,13 @@
 //!
 //! This module is only compiled when the `syntax-tree-sitter` feature is
 //! enabled. `layout_code()` calls `code_spans()` through a `#[cfg]` gate.
+//!
+//! HONEST SCOPE: **Rust is the only grammar compiled in today.** Every
+//! other info string returns `None` and renders as plain code — the
+//! documented degrade, never an error. The `grammars` table below is
+//! the whole list:
+//! adding a language is one row there plus its `tree-sitter-*` crate in
+//! `Cargo.toml`, and nothing else in this module changes.
 
 use std::collections::HashMap;
 use std::sync::OnceLock;
@@ -88,34 +95,55 @@ fn capture_to_role(name: &str) -> ColorRole {
     }
 }
 
-fn build_config(lang: &str) -> Option<HighlightConfiguration> {
-    match lang {
-        "rust" => {
-            let language = Language::new(tree_sitter_rust::LANGUAGE);
-            let mut config = HighlightConfiguration::new(
-                language,
-                "rust",
-                tree_sitter_rust::HIGHLIGHTS_QUERY,
-                "", // injection queries not needed for block rendering
-                "", // locals queries not needed
-            )
-            .ok()?;
-            config.configure(CAPTURES);
-            Some(config)
-        }
-        _ => None,
-    }
+/// The grammars compiled into this build, as
+/// `(info string, grammar, highlights query)`. THE list — add a row
+/// (and the matching `tree-sitter-*` dependency) to support a language.
+/// A grammar whose query fails to compile is skipped, so one bad row
+/// cannot take the whole highlighter down with it.
+fn grammars() -> Vec<(&'static str, Language, &'static str)> {
+    vec![(
+        "rust",
+        Language::new(tree_sitter_rust::LANGUAGE),
+        tree_sitter_rust::HIGHLIGHTS_QUERY,
+    )]
+}
+
+fn build_config(
+    name: &'static str,
+    language: Language,
+    highlights: &str,
+) -> Option<HighlightConfiguration> {
+    let mut config = HighlightConfiguration::new(
+        language,
+        name,
+        highlights,
+        "", // injection queries not needed for block rendering
+        "", // locals queries not needed
+    )
+    .ok()?;
+    config.configure(CAPTURES);
+    Some(config)
 }
 
 fn configs() -> &'static HashMap<&'static str, HighlightConfiguration> {
     static CONFIGS: OnceLock<HashMap<&str, HighlightConfiguration>> = OnceLock::new();
     CONFIGS.get_or_init(|| {
         let mut m = HashMap::new();
-        if let Some(cfg) = build_config("rust") {
-            m.insert("rust", cfg);
+        for (name, language, highlights) in grammars() {
+            if let Some(cfg) = build_config(name, language, highlights) {
+                m.insert(name, cfg);
+            }
         }
         m
     })
+}
+
+/// Info strings this build can highlight, sorted. A consumer can show
+/// this instead of guessing which fences will get colour.
+pub fn supported_languages() -> Vec<&'static str> {
+    let mut v: Vec<&'static str> = configs().keys().copied().collect();
+    v.sort_unstable();
+    v
 }
 
 pub(crate) fn code_spans(
@@ -167,6 +195,16 @@ mod tests {
             spans.iter().any(|(_, r)| *r == ColorRole::CodeKeyword),
             "expected at least one keyword span"
         );
+    }
+
+    #[test]
+    fn supported_languages_is_the_grammar_table() {
+        // Honest scope: whatever GRAMMARS holds is exactly what gets
+        // colour — today that is Rust alone.
+        assert_eq!(supported_languages(), vec!["rust"]);
+        for lang in supported_languages() {
+            assert!(code_spans("", lang).is_some(), "{} configured", lang);
+        }
     }
 
     #[test]
