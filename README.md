@@ -38,6 +38,12 @@ Images are laid out as a **reserved placeholder box** carrying the source — th
 
 Not supported (by design, documented): setext headings, reference-style links, link titles, footnotes, and full CommonMark emphasis corner cases. The parser is infallible — anything unrecognised degrades to plain text, never an error.
 
+Fenced code carries an optional `{1,3-5}` line-highlight list in its info string, honoured by the layout stage, the SVG writer and the HTML writer alike. A malformed range is ignored, never fatal — the block still renders as code.
+
+Syntax colouring is opt-in via the `syntax-tree-sitter` feature, and is honest about its reach: **Rust is the only grammar compiled in today**; any other language renders as plain code. `markmaid::supported_languages()` reports what a given build can actually colour (empty without the feature, so it needs no `#[cfg]` at the call site), and adding a language is one row in `highlight::grammars` plus its `tree-sitter-*` dependency.
+
+A host editor that opens one ` ```mermaid ` fence for editing takes the fence ordinal from `DiagramItem::fence`, indexes `blocks::mermaid_fences()`, and saves through `blocks::splice_fence()`. That enumeration comes from the parsed document, so it holds even when a fence is nested, is still being typed, or currently fails to parse — cases where counting rendered diagrams, or scanning the raw text alone, silently points at the wrong block. A fence that cannot be written back safely reports `range: None` and the save fails loudly instead.
+
 ## Status
 
 Early. API may move before 1.0. Part of the [go-routine](https://go-routine-id.github.io/) open-source family.

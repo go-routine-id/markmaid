@@ -197,15 +197,24 @@ fn fence_open(line: &str) -> Option<(char, usize, String, Vec<std::ops::Range<us
                 if piece.is_empty() {
                     continue;
                 }
+                // A malformed piece is SKIPPED, never fatal. Bailing
+                // out of fence_open here would stop the line being
+                // recognised as a fence at all, and the block's body
+                // would leak into the document as markdown (bug hunt).
                 if let Some((a, b)) = piece.split_once('-') {
-                    let start: usize = a.trim().parse().ok()?;
-                    let end: usize = b.trim().parse().ok()?;
+                    let (Ok(start), Ok(end)) =
+                        (a.trim().parse::<usize>(), b.trim().parse::<usize>())
+                    else {
+                        continue;
+                    };
                     if start == 0 || end < start {
                         continue;
                     }
                     highlight.push(start - 1..end);
                 } else {
-                    let n: usize = piece.parse().ok()?;
+                    let Ok(n) = piece.parse::<usize>() else {
+                        continue;
+                    };
                     if n == 0 {
                         continue;
                     }
@@ -891,6 +900,28 @@ mod tests {
         let d = parse("``` {0,2-1}\nfoo\nbar\n```");
         let Block::Code { highlight, .. } = &d.blocks[0] else { panic!() };
         assert!(highlight.is_empty());
+    }
+
+    #[test]
+    fn malformed_highlight_token_still_yields_a_code_block() {
+        // A non-numeric range must NOT disqualify the fence: before the
+        // fix, `{a}` made fence_open bail, the ``` line became a
+        // paragraph, and the body leaked into the document as markdown.
+        for info in ["```rust {a}", "```rust {1-x}", "```rust {2-}", "```rust {}"] {
+            let src = format!("{}\n# not a heading\n```", info);
+            let d = parse(&src);
+            let Block::Code { lang, source, highlight } = &d.blocks[0] else {
+                panic!("{} should still open a code block", info)
+            };
+            assert_eq!(lang, "rust");
+            assert_eq!(source, "# not a heading", "body stays verbatim");
+            assert!(highlight.is_empty(), "{} yields no ranges", info);
+        }
+
+        // Good pieces survive alongside a bad one.
+        let d = parse("```rust {2,zz,4-5}\na\nb\nc\nd\ne\n```");
+        let Block::Code { highlight, .. } = &d.blocks[0] else { panic!() };
+        assert_eq!(highlight, &vec![1..2, 3..5]);
     }
 
     #[test]

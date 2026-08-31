@@ -195,6 +195,13 @@ pub struct DiagramItem {
     pub x: f64,
     pub y: f64,
     pub scale: f64,
+    /// Which mermaid fence of the document this is, counting every
+    /// mermaid block the parser produced in layout order — including
+    /// ones that failed to parse and rendered as an error card instead
+    /// of a diagram. This is the index into
+    /// [`crate::blocks::mermaid_fences`]; COUNTING `Item::Diagram`s
+    /// instead would drift the moment a diagram is mid-edit and broken.
+    pub fence: usize,
     /// Unscaled engine-space size (width, height).
     pub size: (f64, f64),
     pub view: Box<DiagramView>,

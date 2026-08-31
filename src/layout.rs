@@ -448,6 +448,7 @@ pub fn layout(doc: &Doc, opts: &LayoutOptions) -> DocScene {
     };
     scene.width = width;
     let col = width - 2.0 * MARGIN;
+    let mut fence_n = 0usize;
     let end = layout_blocks(
         &mut scene,
         &doc.blocks,
@@ -457,6 +458,7 @@ pub fn layout(doc: &Doc, opts: &LayoutOptions) -> DocScene {
         opts.base_size,
         &opts.measure,
         opts.table_overflow,
+        &mut fence_n,
     );
     scene.height = end + MARGIN;
     scene
@@ -494,12 +496,13 @@ fn layout_blocks(
     base: f64,
     measure: &Measure,
     table_overflow: TableOverflow,
+    fence_n: &mut usize,
 ) -> f64 {
     for (i, b) in blocks.iter().enumerate() {
         if i > 0 {
             y += space_before(b);
         }
-        y = layout_block(scene, b, x, w, y, base, measure, table_overflow);
+        y = layout_block(scene, b, x, w, y, base, measure, table_overflow, fence_n);
         if i + 1 < blocks.len() {
             y += space_after(b);
         }
@@ -520,6 +523,7 @@ fn layout_block(
     base: f64,
     measure: &Measure,
     table_overflow: TableOverflow,
+    fence_n: &mut usize,
 ) -> f64 {
     match b {
         Block::Heading { level, content } => {
@@ -528,8 +532,16 @@ fn layout_block(
         Block::Paragraph(inls) => {
             layout_inlines(scene, inls, x, w, y, base, ColorRole::Text, false, measure)
         }
-        Block::Code { lang, source, highlight } if is_mermaid(lang) => {
-            layout_mermaid(scene, source, x, w, y, base, measure)
+        // A mermaid fence has no code rows, so `{1-3}` line highlights
+        // do not apply to it — the info string is diagram config.
+        Block::Code { lang, source, .. } if is_mermaid(lang) => {
+            // Claim the ordinal first: a fence that fails to parse
+            // renders as an error card and pushes no Item::Diagram, but
+            // it is still a mermaid block of the document and still
+            // occupies an index in `blocks::mermaid_fences`.
+            let fence = *fence_n;
+            *fence_n += 1;
+            layout_mermaid(scene, source, x, w, y, base, measure, fence)
         }
         Block::Code {
             lang,
@@ -539,8 +551,12 @@ fn layout_block(
         } => layout_code(scene, lang, source, highlight, x, w, y, base, measure),
         // Raw HTML is shown verbatim as code — never interpreted.
         Block::Html(source) => layout_code(scene, "", source, &[], x, w, y, base, measure),
-        Block::Quote(blocks) => layout_quote(scene, blocks, x, w, y, base, measure, table_overflow),
-        Block::List(list) => layout_list(scene, list, x, w, y, base, measure, table_overflow),
+        Block::Quote(blocks) => {
+            layout_quote(scene, blocks, x, w, y, base, measure, table_overflow, fence_n)
+        }
+        Block::List(list) => {
+            layout_list(scene, list, x, w, y, base, measure, table_overflow, fence_n)
+        }
         Block::Table(table) => layout_table(scene, table, x, w, y, base, measure, table_overflow),
         Block::Rule => {
             scene.items.push(Item::Line(LineItem {
@@ -792,6 +808,7 @@ fn layout_quote(
     base: f64,
     measure: &Measure,
     table_overflow: TableOverflow,
+    fence_n: &mut usize,
 ) -> f64 {
     let idx = scene.items.len();
     let inner_end = layout_blocks(
@@ -803,6 +820,7 @@ fn layout_quote(
         base,
         measure,
         table_overflow,
+        fence_n,
     );
     let h = (inner_end + QUOTE_PAD) - y;
     scene.items.insert(
@@ -841,6 +859,7 @@ fn layout_list(
     base: f64,
     measure: &Measure,
     table_overflow: TableOverflow,
+    fence_n: &mut usize,
 ) -> f64 {
     let lh = line_h(base);
     let mut y = y;
@@ -907,6 +926,7 @@ fn layout_list(
             base,
             measure,
             table_overflow,
+            fence_n,
         );
         // Never end above the marker's own line.
         y = end.max(y + lh);
@@ -1045,6 +1065,7 @@ fn layout_mermaid(
     y: f64,
     base: f64,
     measure: &Measure,
+    fence: usize,
 ) -> f64 {
     let parsed = match flowmaid::parser::parse_document(source) {
         Ok(p) => p,
@@ -1117,6 +1138,7 @@ fn layout_mermaid(
         x: x + DIAGRAM_PAD,
         y: y + DIAGRAM_PAD,
         scale,
+        fence,
         size,
         view: Box::new(view),
     }));
