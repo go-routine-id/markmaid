@@ -528,7 +528,9 @@ fn layout_block(
         Block::Paragraph(inls) => {
             layout_inlines(scene, inls, x, w, y, base, ColorRole::Text, false, measure)
         }
-        Block::Code { lang, source, highlight } if is_mermaid(lang) => {
+        // A mermaid fence has no code rows, so `{1-3}` line highlights
+        // do not apply to it — the info string is diagram config.
+        Block::Code { lang, source, .. } if is_mermaid(lang) => {
             layout_mermaid(scene, source, x, w, y, base, measure)
         }
         Block::Code {
