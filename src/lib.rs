@@ -58,10 +58,40 @@ pub fn render_svg(source: &str, width: f64) -> String {
     scene::render_svg(source, width)
 }
 
+/// Info strings this build can syntax-highlight, sorted.
+///
+/// Empty unless the `syntax-tree-sitter` feature is on, so a consumer
+/// may call it unconditionally instead of mirroring the feature flag in
+/// its own `#[cfg]`s. Today the feature compiles in Rust alone.
+pub fn supported_languages() -> Vec<&'static str> {
+    #[cfg(feature = "syntax-tree-sitter")]
+    {
+        highlight::supported_languages()
+    }
+    #[cfg(not(feature = "syntax-tree-sitter"))]
+    {
+        Vec::new()
+    }
+}
+
 /// Markdown → semantic HTML fragment. Mermaid blocks are inlined as
 /// SVG `<figure>`s; a block that fails to parse becomes a
 /// line-numbered `<pre class="markmaid-error">` instead of breaking
 /// the page.
 pub fn render_html(source: &str) -> String {
     html::render_html(source)
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn supported_languages_needs_no_cfg_at_the_call_site() {
+        // Callable either way; the feature only changes what comes back.
+        let langs = crate::supported_languages();
+        #[cfg(feature = "syntax-tree-sitter")]
+        assert_eq!(langs, vec!["rust"]);
+        #[cfg(not(feature = "syntax-tree-sitter"))]
+        assert!(langs.is_empty());
+        assert!(langs.windows(2).all(|w| w[0] <= w[1]), "sorted");
+    }
 }
