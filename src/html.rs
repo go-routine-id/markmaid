@@ -199,7 +199,11 @@ fn block_html(out: &mut String, b: &Block, mermaid_n: &mut usize) {
                 }
             }
         }
-        Block::Code { lang, source, .. } => code_block_html(out, lang, source),
+        Block::Code {
+            lang,
+            source,
+            highlight,
+        } => code_block_html(out, lang, source, highlight),
         Block::Quote(blocks) => {
             out.push_str("<blockquote>\n");
             for b in blocks {
@@ -220,14 +224,24 @@ fn block_html(out: &mut String, b: &Block, mermaid_n: &mut usize) {
     }
 }
 
-/// Emit a fenced code block or raw-HTML block as escaped HTML.
+/// Emit a fenced code block as escaped HTML.
+///
 /// When the `syntax-tree-sitter` feature is enabled and the language is
 /// supported, each token is wrapped in a `<span style="color:#...">`.
-fn code_block_html(out: &mut String, lang: &str, source: &str) {
+/// Lines named by the fence's `{1,3-5}` info string get a background
+/// band, matching what the layout stage paints into a `DocScene` — the
+/// two writers must not disagree about what a document looks like.
+fn code_block_html(
+    out: &mut String,
+    lang: &str,
+    source: &str,
+    highlight: &[std::ops::Range<usize>],
+) {
     #[cfg(feature = "syntax-tree-sitter")]
     let spans = crate::highlight::code_spans(source, lang);
     #[cfg(not(feature = "syntax-tree-sitter"))]
     let spans: Option<Vec<(std::ops::Range<usize>, crate::scene::ColorRole)>> = None;
+    let spans = spans.as_deref();
 
     if lang.is_empty() {
         out.push_str("<pre><code>");
@@ -235,29 +249,68 @@ fn code_block_html(out: &mut String, lang: &str, source: &str) {
         out.push_str(&format!("<pre><code class=\"language-{}\">", esc_attr(lang)));
     }
 
-    if let Some(spans) = spans {
-        let mut pos = 0;
-        for (range, role) in &spans {
-            if range.start > pos {
-                out.push_str(&esc_text(&source[pos..range.start]));
-            }
-            let color = crate::scene::role_color(*role);
-            out.push_str(&format!("<span style=\"color:{};\">", color));
-            out.push_str(&esc_text(&source[range.clone()]));
+    // Walk the source line by line, keeping each line's byte range so
+    // token spans can be clipped to it — a highlight band is a block
+    // box, and a coloured token may not straddle it.
+    let mut cursor = 0usize;
+    for (idx, line_with_nl) in source.split_inclusive('\n').enumerate() {
+        let nl = usize::from(line_with_nl.ends_with('\n'));
+        let line = cursor..cursor + line_with_nl.len() - nl;
+        cursor += line_with_nl.len();
+        let banded = highlight.iter().any(|r| r.contains(&idx));
+        if banded {
+            out.push_str(&format!(
+                "<span class=\"markmaid-hl\" style=\"display:block;background:{};\">",
+                crate::scene::role_color(crate::scene::ColorRole::CodeHighlightBg),
+            ));
+        }
+        code_line_html(out, source, line, spans);
+        // The newline lives INSIDE the band, so the block box covers
+        // the whole line and no blank line is added after it.
+        out.push('\n');
+        if banded {
             out.push_str("</span>");
-            pos = range.end;
         }
-        if pos < source.len() {
-            out.push_str(&esc_text(&source[pos..]));
-        }
-    } else {
-        out.push_str(&esc_text(source));
     }
 
-    if !source.is_empty() && !source.ends_with('\n') {
-        out.push('\n');
-    }
     out.push_str("</code></pre>\n");
+}
+
+/// One line of a code block: the slice `line` of `source`, escaped,
+/// with any syntax spans overlapping it wrapped in coloured `<span>`s.
+fn code_line_html(
+    out: &mut String,
+    source: &str,
+    line: std::ops::Range<usize>,
+    spans: Option<&[(std::ops::Range<usize>, crate::scene::ColorRole)]>,
+) {
+    let Some(spans) = spans else {
+        out.push_str(&esc_text(&source[line]));
+        return;
+    };
+    let mut pos = line.start;
+    for (range, role) in spans {
+        if range.end <= line.start || range.start >= line.end {
+            continue;
+        }
+        let start = range.start.max(line.start);
+        let end = range.end.min(line.end);
+        if start > pos {
+            out.push_str(&esc_text(&source[pos..start]));
+        }
+        if start < end {
+            out.push_str(&format!(
+                "<span style=\"color:{};\">",
+                crate::scene::role_color(*role),
+            ));
+            out.push_str(&esc_text(&source[start..end]));
+            out.push_str("</span>");
+        }
+        pos = end;
+    }
+    if pos < line.end {
+        out.push_str(&esc_text(&source[pos..line.end]));
+    }
 }
 
 fn list_html(out: &mut String, list: &List, mermaid_n: &mut usize) {
@@ -476,6 +529,57 @@ mod tests {
         }]));
         assert!(html.contains("<pre><code>plain\n</code></pre>"));
         assert!(!html.contains("language-"));
+    }
+
+    #[test]
+    fn highlighted_lines_get_a_background_band() {
+        // The fence's `{1,3}` must reach HTML too — the layout stage
+        // already paints a CodeHighlightBg rect for these rows, and the
+        // two writers may not disagree about the document.
+        let html = html_of(&doc(vec![Block::Code {
+            lang: "".into(),
+            source: "one\ntwo\nthree".into(),
+            highlight: vec![0..1, 2..3],
+        }]));
+        let band = format!(
+            "<span class=\"markmaid-hl\" style=\"display:block;background:{};\">",
+            crate::scene::role_color(crate::scene::ColorRole::CodeHighlightBg),
+        );
+        assert_eq!(html.matches(&band).count(), 2, "lines 1 and 3 banded");
+        // The newline sits inside the band so the block box covers the
+        // whole line without adding a blank one after it.
+        assert!(html.contains(&format!("{}one\n</span>", band)), "{}", html);
+        assert!(html.contains(&format!("{}three\n</span>", band)), "{}", html);
+        // Line 2 is untouched, and its newline stays outside any band.
+        assert!(html.contains("</span>two\n"), "{}", html);
+    }
+
+    #[test]
+    fn code_block_without_highlight_has_no_bands() {
+        let html = html_of(&doc(vec![Block::Code {
+            lang: "".into(),
+            source: "a\nb".into(),
+            highlight: vec![],
+        }]));
+        assert_eq!(html, "<pre><code>a\nb\n</code></pre>\n");
+    }
+
+    #[test]
+    #[cfg(feature = "syntax-tree-sitter")]
+    fn highlight_band_and_syntax_spans_coexist() {
+        // A coloured token may not straddle the band's block box: the
+        // band wraps the line, the token spans sit inside it.
+        let html = html_of(&doc(vec![Block::Code {
+            lang: "rust".into(),
+            source: "let a = 1;\nlet b = 2;".into(),
+            highlight: std::iter::once(0..1).collect(),
+        }]));
+        let band_start = html.find("markmaid-hl").expect("band present");
+        let band_end = html[band_start..].find("</span>\n").map(|i| band_start + i);
+        assert!(band_end.is_some() || html.contains("</span></span>"), "{}", html);
+        assert!(html.contains("color:"), "syntax spans still emitted: {}", html);
+        // Both lines are still present, in order, exactly once.
+        assert_eq!(html.matches("let").count(), 2, "{}", html);
     }
 
     #[test]
