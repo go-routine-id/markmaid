@@ -251,8 +251,11 @@ fn code_block_html(
 
     // Walk the source line by line, keeping each line's byte range so
     // token spans can be clipped to it — a highlight band is a block
-    // box, and a coloured token may not straddle it.
+    // box, and a coloured token may not straddle it. `span_cursor`
+    // carries the span walk ACROSS lines: restarting it per line would
+    // make a big code block quadratic in its token count.
     let mut cursor = 0usize;
+    let mut span_cursor = 0usize;
     for (idx, line_with_nl) in source.split_inclusive('\n').enumerate() {
         let nl = usize::from(line_with_nl.ends_with('\n'));
         let line = cursor..cursor + line_with_nl.len() - nl;
@@ -264,7 +267,7 @@ fn code_block_html(
                 crate::scene::role_color(crate::scene::ColorRole::CodeHighlightBg),
             ));
         }
-        code_line_html(out, source, line, spans);
+        code_line_html(out, source, line, spans, &mut span_cursor);
         // The newline lives INSIDE the band, so the block box covers
         // the whole line and no blank line is added after it.
         out.push('\n');
@@ -278,20 +281,30 @@ fn code_block_html(
 
 /// One line of a code block: the slice `line` of `source`, escaped,
 /// with any syntax spans overlapping it wrapped in coloured `<span>`s.
+///
+/// `next` is the caller's cursor into `spans`, advanced only past spans
+/// this line has left behind for good — a span straddling the line end
+/// is revisited by the next line, everything earlier is skipped once.
 fn code_line_html(
     out: &mut String,
     source: &str,
     line: std::ops::Range<usize>,
     spans: Option<&[(std::ops::Range<usize>, crate::scene::ColorRole)]>,
+    next: &mut usize,
 ) {
     let Some(spans) = spans else {
         out.push_str(&esc_text(&source[line]));
         return;
     };
+    // tree-sitter emits spans sorted and disjoint, so anything ending at
+    // or before this line's start is done with.
+    while *next < spans.len() && spans[*next].0.end <= line.start {
+        *next += 1;
+    }
     let mut pos = line.start;
-    for (range, role) in spans {
-        if range.end <= line.start || range.start >= line.end {
-            continue;
+    for (range, role) in &spans[*next..] {
+        if range.start >= line.end {
+            break;
         }
         let start = range.start.max(line.start);
         let end = range.end.min(line.end);
@@ -552,6 +565,31 @@ mod tests {
         assert!(html.contains(&format!("{}three\n</span>", band)), "{}", html);
         // Line 2 is untouched, and its newline stays outside any band.
         assert!(html.contains("</span>two\n"), "{}", html);
+    }
+
+    #[test]
+    #[cfg(feature = "syntax-tree-sitter")]
+    fn a_span_straddling_a_band_boundary_is_not_dropped() {
+        // The span walk is one forward pass across lines now; a token
+        // that spans several lines (a raw string) must still colour
+        // every line it covers, banded or not.
+        let source = "let s = r#\"one\ntwo\nthree\"#;\nlet t = 1;";
+        let html = html_of(&doc(vec![Block::Code {
+            lang: "rust".into(),
+            source: source.into(),
+            highlight: std::iter::once(1..2).collect(),
+        }]));
+        for line in ["one", "two", "three"] {
+            assert!(html.contains(line), "{} survives: {}", line, html);
+        }
+        assert_eq!(html.matches("markmaid-hl").count(), 1, "one band");
+        // The band sits on line 2 and the string keeps its colour there.
+        let band = html.split("markmaid-hl").nth(1).unwrap();
+        assert!(band.starts_with(&format!(
+            "\" style=\"display:block;background:{};\">",
+            crate::scene::role_color(crate::scene::ColorRole::CodeHighlightBg)
+        )), "{}", band);
+        assert!(html.contains("color:"), "syntax colour still emitted");
     }
 
     #[test]
