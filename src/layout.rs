@@ -7,10 +7,11 @@
 //! this stage diverges from a real renderer:
 //! - code lines are hard-broken at character level to stay inside
 //!   the code card (real renderers scroll or overflow instead);
-//! - table cells are single-line and never truncated; by default a
-//!   table wider than the column narrows every column proportionally,
-//!   while interactive consumers may opt into `TableOverflow::Natural`
-//!   to keep columns at their natural width and scroll horizontally;
+//! - table cells WRAP into their column and are never truncated, so a
+//!   row is as tall as its tallest cell; by default a table wider than
+//!   the column narrows every column proportionally, while interactive
+//!   consumers may opt into `TableOverflow::Natural` to keep columns at
+//!   their natural width and scroll horizontally;
 //! - an unbreakable word wider than the column is hard-broken at
 //!   character level (real renderers overflow instead).
 
@@ -406,9 +407,9 @@ fn layout_image(scene: &mut DocScene, src: &str, alt: &str, x: f64, w: f64, y: f
     y + ih + BLOCK_SPACE
 }
 
-/// Inline content as a single unwrapped line of fragments measured
-/// at origin 0 — table cells. Hard breaks become spaces.
-fn line_frags(inlines: &[Inline], size: f64, measure: &Measure) -> Vec<Frag> {
+/// Inline content of a table cell, wrapped into `w` and measured from
+/// origin 0. Hard breaks become spaces — a cell is prose, not a block.
+fn cell_lines(inlines: &[Inline], w: f64, size: f64, measure: &Measure) -> Vec<Vec<Frag>> {
     let clean: Vec<Inline> = inlines
         .iter()
         .map(|r| Inline {
@@ -416,8 +417,13 @@ fn line_frags(inlines: &[Inline], size: f64, measure: &Measure) -> Vec<Frag> {
             ..r.clone()
         })
         .collect();
-    let toks = tokenize(&clean);
-    wrap_frags(&toks, 0.0, f64::INFINITY, size, measure)
+    wrap_frags(&tokenize(&clean), 0.0, w, size, measure)
+}
+
+/// Inline content as a single UNWRAPPED line — how wide a table cell
+/// wants to be before any column fitting.
+fn line_frags(inlines: &[Inline], size: f64, measure: &Measure) -> Vec<Frag> {
+    cell_lines(inlines, f64::INFINITY, size, measure)
         .pop()
         .unwrap_or_default()
 }
@@ -952,11 +958,9 @@ fn layout_table(
     // Capture the item range so a Natural-width table can be rendered
     // inside a horizontal scroll area by the consumer.
     let item_start = scene.items.len();
-    // Measure: every cell as one unwrapped line.
-    let mut cells: Vec<Vec<Vec<Frag>>> = Vec::with_capacity(rows.len());
+    // Measure what each column WANTS: the widest cell, unwrapped.
     let mut colw = vec![CELL_MIN_W; ncols];
     for row in rows {
-        let mut frow = Vec::with_capacity(ncols);
         for c in 0..ncols {
             let frags = row
                 .get(c)
@@ -964,9 +968,7 @@ fn layout_table(
                 .unwrap_or_default();
             let tw = frags.last().map(|f| f.x + f.w).unwrap_or(0.0);
             colw[c] = colw[c].max(tw + CELL_PAD_X);
-            frow.push(frags);
         }
-        cells.push(frow);
     }
     let natural: f64 = colw.iter().sum();
     // Shrink keeps the frame on the page (SVG/HTML default). Natural
@@ -983,17 +985,45 @@ fn layout_table(
         }
         TableOverflow::Natural => (natural, natural),
     };
-    let row_h = line_h(base) + CELL_PAD_Y;
-    let total_h = rows.len() as f64 * row_h;
+    // Now that the columns are final, wrap every cell INTO its column.
+    // Skipping this is what used to draw a shrunk table's text over the
+    // next column and straight off the page.
+    let lh = line_h(base);
+    let mut cells: Vec<Vec<Vec<Vec<Frag>>>> = Vec::with_capacity(rows.len());
+    let mut row_hs: Vec<f64> = Vec::with_capacity(rows.len());
+    for row in rows {
+        let mut wrow = Vec::with_capacity(ncols);
+        let mut tallest = 1usize;
+        for c in 0..ncols {
+            let inner = (colw[c] - CELL_PAD_X).max(1.0);
+            let lines = row
+                .get(c)
+                .map(|cell| cell_lines(cell, inner, base, measure))
+                .unwrap_or_default();
+            tallest = tallest.max(lines.len().max(1));
+            wrow.push(lines);
+        }
+        row_hs.push(tallest as f64 * lh + CELL_PAD_Y);
+        cells.push(wrow);
+    }
+    // Row tops, so stripes and grid lines follow the variable heights.
+    let mut row_y: Vec<f64> = Vec::with_capacity(rows.len() + 1);
+    let mut acc = y;
+    for h in &row_hs {
+        row_y.push(acc);
+        acc += h;
+    }
+    row_y.push(acc);
+    let total_h = acc - y;
 
     // Stripes: header strip + every odd body row.
     for r in 0..rows.len() {
         if r == 0 || (r - 1) % 2 == 1 {
             scene.items.push(Item::Rect(RectItem {
                 x,
-                y: y + r as f64 * row_h,
+                y: row_y[r],
                 w: total_w,
-                h: row_h,
+                h: row_hs[r],
                 rounding: 0.0,
                 fill: Some(ColorRole::TableStripeBg),
                 stroke: None,
@@ -1002,7 +1032,7 @@ fn layout_table(
     }
     // Grid: frame plus every row/column separator.
     for r in 0..=rows.len() {
-        let ly = y + r as f64 * row_h;
+        let ly = row_y[r];
         scene.items.push(Item::Line(LineItem {
             x1: x,
             y1: ly,
@@ -1024,17 +1054,27 @@ fn layout_table(
             cx += colw[c];
         }
     }
-    // Cell text: header bold, everything single-line.
-    for (r, frow) in cells.into_iter().enumerate() {
-        let ty = y + r as f64 * row_h + CELL_PAD_Y / 2.0;
+    // Cell text: header bold, each cell as many lines as it wrapped to.
+    for (r, wrow) in cells.into_iter().enumerate() {
+        let ty = row_y[r] + CELL_PAD_Y / 2.0;
         let (role, strong) = if r == 0 {
             (ColorRole::Strong, true)
         } else {
             (ColorRole::Text, false)
         };
         let mut cx = x;
-        for (c, frags) in frow.into_iter().enumerate() {
-            emit_line(scene, frags, cx + CELL_PAD_X / 2.0, ty, base, role, strong);
+        for (c, lines) in wrow.into_iter().enumerate() {
+            for (i, frags) in lines.into_iter().enumerate() {
+                emit_line(
+                    scene,
+                    frags,
+                    cx + CELL_PAD_X / 2.0,
+                    ty + i as f64 * lh,
+                    base,
+                    role,
+                    strong,
+                );
+            }
             cx += colw[c];
         }
     }
@@ -1454,7 +1494,21 @@ mod tests {
                     assert!(im.x >= -0.5);
                     assert!(im.x + im.w <= scene.width + 0.5, "image right {}", im.x + im.w);
                 }
-                Item::Text(_) => {}
+                // Text was exempt here for a long time, and a real
+                // bug hid behind the exemption: shrunk table columns
+                // kept drawing their text at full width, spilling over
+                // the neighbouring column and off the page.
+                Item::Text(t) => {
+                    assert!(t.x >= -0.5, "text x {} < 0: {:?}", t.x, t.text);
+                    let end = t.x + estimated_width(&t.text, t.size, t.mono);
+                    assert!(
+                        end <= scene.width + 0.5,
+                        "text right {} > width {}: {:?}",
+                        end,
+                        scene.width,
+                        t.text
+                    );
+                }
             }
         }
     }
@@ -2233,6 +2287,136 @@ mod tests {
         let svg = doc_to_svg(&sc);
         assert!(svg.contains("<svg x="));
         assert!(svg.contains("&lt;b&gt;raw&lt;/b&gt;"));
+    }
+
+    /// Column dividers of the first table in `sc`, left to right.
+    fn col_bounds(sc: &DocScene) -> Vec<f64> {
+        let mut v: Vec<f64> = glines(sc)
+            .iter()
+            .filter(|l| (l.x1 - l.x2).abs() < 0.01)
+            .map(|l| l.x1)
+            .collect();
+        v.sort_by(|a, b| a.partial_cmp(b).unwrap());
+        v.dedup();
+        v
+    }
+
+    /// Row separators, top to bottom.
+    fn row_bounds(sc: &DocScene) -> Vec<f64> {
+        let mut v: Vec<f64> = glines(sc)
+            .iter()
+            .filter(|l| (l.y1 - l.y2).abs() < 0.01)
+            .map(|l| l.y1)
+            .collect();
+        v.sort_by(|a, b| a.partial_cmp(b).unwrap());
+        v.dedup();
+        v
+    }
+
+    #[test]
+    fn wide_table_wraps_into_its_columns_instead_of_spilling() {
+        // Shrinking the COLUMNS while drawing the text at full width
+        // put every cell over its neighbour and off the page. Column
+        // widths are the constraint; the text has to obey them.
+        let cell = |s: &str| vec![Inline::plain(s)];
+        let sc = layout(
+            &doc(vec![Block::Table(Table {
+                rows: vec![
+                    vec![
+                        cell("Komponen yang namanya panjang sekali"),
+                        cell("Keterangan lengkap dan bertele-tele"),
+                    ],
+                    vec![
+                        cell("payment-gateway-service-production"),
+                        cell("menunggu konfirmasi dari tim infrastruktur"),
+                    ],
+                ],
+            })]),
+            &opts(360.0),
+        );
+        assert_within(&sc);
+        let bounds = col_bounds(&sc);
+        assert_eq!(bounds.len(), 3, "two columns => three dividers");
+        for t in texts(&sc) {
+            let end = t.x + estimated_width(&t.text, t.size, t.mono);
+            let right = *bounds
+                .iter()
+                .find(|&&b| b > t.x + 0.01)
+                .expect("every run starts inside a column");
+            assert!(
+                end <= right + 0.5,
+                "{:?} ends at {} past its column divider {}",
+                t.text,
+                end,
+                right
+            );
+        }
+        assert!(
+            texts(&sc).len() > 4,
+            "four cells wrapped to more than four runs"
+        );
+    }
+
+    #[test]
+    fn a_row_is_as_tall_as_its_tallest_cell() {
+        let cell = |s: &str| vec![Inline::plain(s)];
+        let sc = layout(
+            &doc(vec![Block::Table(Table {
+                rows: vec![
+                    vec![cell("a"), cell("b")],
+                    vec![cell("satu dua tiga empat lima enam tujuh delapan"), cell("x")],
+                ],
+            })]),
+            &opts(300.0),
+        );
+        let ys = row_bounds(&sc);
+        assert_eq!(ys.len(), 3, "two rows => three separators");
+        let header = ys[1] - ys[0];
+        let wrapped = ys[2] - ys[1];
+        assert!(
+            wrapped > header + 1.0,
+            "wrapped row {} should outgrow the single-line header {}",
+            wrapped,
+            header
+        );
+        // The stripe behind a row matches that row's own height.
+        assert!(
+            rects(&sc).iter().any(|r| (r.h - header).abs() < 0.5),
+            "header stripe follows the header's height"
+        );
+    }
+
+    #[test]
+    fn a_table_that_already_fits_is_left_alone() {
+        let cell = |s: &str| vec![Inline::plain(s)];
+        let sc = layout(
+            &doc(vec![Block::Table(Table {
+                rows: vec![vec![cell("a"), cell("b")], vec![cell("c"), cell("d")]],
+            })]),
+            &opts(720.0),
+        );
+        assert_eq!(texts(&sc).len(), 4, "one run per cell, no wrapping");
+        let ys = row_bounds(&sc);
+        assert!(
+            ((ys[1] - ys[0]) - (ys[2] - ys[1])).abs() < 0.01,
+            "both rows keep the same single-line height"
+        );
+    }
+
+    #[test]
+    fn table_survives_a_column_narrower_than_one_word() {
+        let cell = |s: &str| vec![Inline::plain(s)];
+        let sc = layout(
+            &doc(vec![Block::Table(Table {
+                rows: vec![
+                    vec![cell("kolomsatu"), cell("kolomdua"), cell("kolomtiga")],
+                    vec![cell("antidisestablishmentarianism"), cell("x"), cell("y")],
+                ],
+            })]),
+            &opts(MIN_DOC_WIDTH),
+        );
+        assert_within(&sc);
+        assert!(sc.height.is_finite() && sc.height > 0.0);
     }
 
     #[test]
