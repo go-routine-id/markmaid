@@ -1,6 +1,6 @@
 [package]
 name = "markmaid"
-version = "0.4.0"
+version = "0.4.1"
 edition = "2021"
 rust-version = "1.77"
 description = "Framework-agnostic Markdown rendering engine in pure Rust: hand-written GFM-subset parser, document layout to plain positioned geometry (DocScene) any GUI toolkit can paint, SVG/HTML writers, first-class inline mermaid diagrams via flowmaid, and optional tree-sitter syntax highlighting (Rust grammar today)."
